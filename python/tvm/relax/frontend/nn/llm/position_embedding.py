@@ -184,9 +184,15 @@ def yarn_find_correction_dim(
     max_position_embeddings: int,
 ):
     """Inverse dim formula to find dim based on number of rotations"""
-    return (d * math.log(max_position_embeddings / (num_rotations * 2 * math.pi))) / (
-        2 * math.log(theta)
-    )
+    return (
+        d
+        * tir.log(
+            tir.const(
+                max_position_embeddings / (num_rotations * 2 * math.pi),
+                "float32",
+            )
+        )
+    ) / (2 * tir.log(theta))
 
 
 def yarn_find_correction_range(
