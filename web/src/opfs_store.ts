@@ -17,7 +17,7 @@
  * under the License.
  */
 
-interface OPFSWritableFileStream {
+interface OPFSWritableFileStream extends WritableStream<Uint8Array> {
   write(data: Blob | BufferSource | string): Promise<void>;
   close(): Promise<void>;
 }
@@ -109,12 +109,17 @@ export class OPFSStore {
       `${baseName}.meta.json`,
       { create: true },
     );
-    const buffer = await response.arrayBuffer();
     const metadata: OPFSStoreMetadata = {
       url,
       contentType: response.headers.get("content-type") ?? undefined,
     };
-    await this.writeFile(dataHandle, buffer);
+    const writable = await dataHandle.createWritable();
+    if (response.body !== null) {
+      await response.body.pipeTo(writable);
+    } else {
+      await writable.write(await response.arrayBuffer());
+      await writable.close();
+    }
     await this.writeFile(
       metadataHandle,
       new TextEncoder().encode(JSON.stringify(metadata)),
