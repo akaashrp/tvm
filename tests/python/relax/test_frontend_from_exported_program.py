@@ -5507,6 +5507,28 @@ def test_slice_with_symbolic_end():
     verify_model(SliceStaticModel(), example_args_static, {}, ExpectedStatic)
 
 
+def test_derived_input_dimension_without_exported_program_decomposition():
+    class IdentityPair(torch.nn.Module):
+        def forward(self, x, y):
+            return x, y
+
+    frames = torch.export.Dim("frames", min=1, max=8)
+    exported_program = export(
+        IdentityPair(),
+        args=(torch.randn(1, 4, 3), torch.randn(1, 8, 3)),
+        dynamic_shapes=({1: frames}, {1: 2 * frames}),
+    )
+    mod = from_exported_program(
+        exported_program,
+        keep_params_as_input=True,
+        run_ep_decomposition=False,
+    )
+
+    x_shape = mod["main"].params[0].ty.shape.values
+    y_shape = mod["main"].params[1].ty.shape.values
+    assert tvm.arith.Analyzer().can_prove_equal(y_shape[1], x_shape[1] * 2)
+
+
 def test_split():
     class Chunk(Module):
         def forward(self, input):
