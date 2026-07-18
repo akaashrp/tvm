@@ -572,23 +572,54 @@ class BaseFXGraphImporter(metaclass=abc.ABCMeta):
 
     def _pow(self, node: fx.Node) -> relax.Var:
         lhs, rhs = self.retrieve_args(node)
-        # torch integer pow returns an integer tensor, but relax.op.power legalizes to
-        # TOPI power which requires floating-point inputs. Decompose an integer base with
-        # a constant non-negative integer exponent into repeated multiplication instead.
-        if (
-            isinstance(lhs, relax.Expr)
-            and isinstance(lhs.ty, relax.TensorType)
-            and lhs.ty.dtype.matches_code(DataTypeCode.INT, DataTypeCode.UINT)
-            and isinstance(rhs, int)
-            and not isinstance(rhs, bool)
-            and rhs >= 0
-        ):
-            if rhs == 0:
-                return self.block_builder.emit(relax.op.ones_like(lhs))
-            result = lhs
-            for _ in range(rhs - 1):
-                result = self.block_builder.emit(relax.op.multiply(result, lhs))
-            return result
+        if isinstance(lhs, relax.Expr) and isinstance(lhs.ty, relax.TensorType):
+            lhs_dtype = lhs.ty.dtype
+            integer_base_and_exponent = (
+                lhs_dtype.matches_code(DataTypeCode.INT, DataTypeCode.UINT)
+                and isinstance(rhs, int)
+                and not isinstance(rhs, bool)
+                and rhs >= 0
+            )
+            integral_float_exponent = (
+                lhs_dtype.matches_code(DataTypeCode.FLOAT, DataTypeCode.BFLOAT)
+                and isinstance(rhs, float)
+                and rhs >= 0
+                and rhs.is_integer()
+            )
+
+            # TOPI power requires floating-point inputs, and some backends do not preserve
+            # the sign of a negative base for integer-valued floating-point exponents.
+            if integer_base_and_exponent or integral_float_exponent:
+                exponent = int(rhs)
+                if exponent == 0:
+                    return self.block_builder.emit(relax.op.ones_like(lhs))
+
+                # Exponentiation by squaring avoids linear graph growth for large exponents.
+                result = None
+                factor = lhs
+                while exponent:
+                    if exponent & 1:
+                        result = (
+                            factor
+                            if result is None
+                            else self.block_builder.emit(relax.op.multiply(result, factor))
+                        )
+                    exponent >>= 1
+                    if exponent:
+                        factor = self.block_builder.emit(relax.op.multiply(factor, factor))
+                return result
+
+            # A floating-point scalar promotes an integer tensor base to PyTorch's inferred
+            # result dtype.  Preserve that promotion before lowering to Relax power.
+            if lhs_dtype.matches_code(DataTypeCode.INT, DataTypeCode.UINT) and isinstance(
+                rhs, float
+            ):
+                output_meta = node.meta.get("val")
+                if isinstance(output_meta, self.torch.Tensor):
+                    output_dtype = self._convert_data_type(output_meta.dtype)
+                    lhs = self.block_builder.emit(relax.op.astype(lhs, output_dtype))
+                    rhs = relax.const(rhs, output_dtype)
+                    return self.block_builder.emit(relax.op.power(lhs, rhs))
         return self._binary_op(relax.op.power, operator.pow)(node)
 
     def _div(self, node: fx.Node) -> relax.Var:

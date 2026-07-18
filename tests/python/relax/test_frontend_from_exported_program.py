@@ -1079,14 +1079,93 @@ def test_pow_integer():
             # block 0
             with R.dataflow():
                 lv: R.Tensor((4,), dtype="int64") = R.multiply(input, input)
-                lv1: R.Tensor((4,), dtype="int64") = R.multiply(lv, input)
-                lv2: R.Tensor((4,), dtype="int64") = R.multiply(lv1, input)
-                gv: R.Tuple(R.Tensor((4,), dtype="int64")) = (lv2,)
+                lv1: R.Tensor((4,), dtype="int64") = R.multiply(lv, lv)
+                gv: R.Tuple(R.Tensor((4,), dtype="int64")) = (lv1,)
                 R.output(gv)
             return gv
 
     example_args = (torch.tensor([-1, 1, 2, 3], dtype=torch.int64),)
     verify_model(Pow(), example_args, {}, expected)
+
+
+def test_pow_float_integer_exponent():
+    class Pow(Module):
+        def forward(self, input):
+            return input.pow(3.0)
+
+    @tvm.script.ir_module
+    class expected:
+        @R.function
+        def main(
+            input: R.Tensor((4,), dtype="float32"),
+        ) -> R.Tuple(R.Tensor((4,), dtype="float32")):
+            with R.dataflow():
+                lv: R.Tensor((4,), dtype="float32") = R.multiply(input, input)
+                lv1: R.Tensor((4,), dtype="float32") = R.multiply(input, lv)
+                gv: R.Tuple(R.Tensor((4,), dtype="float32")) = (lv1,)
+                R.output(gv)
+            return gv
+
+    example_args = (torch.tensor([-2.0, -1.0, 1.0, 2.0], dtype=torch.float32),)
+    verify_model(Pow(), example_args, {}, expected)
+    verify_model_numerically(Pow(), example_args)
+
+
+@pytest.mark.parametrize("exponent", [0.0, 1.0])
+def test_pow_float_integer_exponent_identity_cases(exponent):
+    class Pow(Module):
+        def forward(self, input):
+            return input.pow(exponent)
+
+    example_args = (torch.tensor([-2.0, -1.0, 1.0, 2.0], dtype=torch.float32),)
+    verify_model_numerically(Pow(), example_args)
+
+
+def test_pow_float_integer_exponent_large():
+    class Pow(Module):
+        def forward(self, input):
+            return input.pow(17.0)
+
+    @tvm.script.ir_module
+    class expected:
+        @R.function
+        def main(input: R.Tensor((2,), dtype="float32")) -> R.Tuple(
+            R.Tensor((2,), dtype="float32")
+        ):
+            with R.dataflow():
+                lv: R.Tensor((2,), dtype="float32") = R.multiply(input, input)
+                lv1: R.Tensor((2,), dtype="float32") = R.multiply(lv, lv)
+                lv2: R.Tensor((2,), dtype="float32") = R.multiply(lv1, lv1)
+                lv3: R.Tensor((2,), dtype="float32") = R.multiply(lv2, lv2)
+                lv4: R.Tensor((2,), dtype="float32") = R.multiply(input, lv3)
+                gv: R.Tuple(R.Tensor((2,), dtype="float32")) = (lv4,)
+                R.output(gv)
+            return gv
+
+    example_args = (torch.tensor([-1.25, 0.5], dtype=torch.float32),)
+    verify_model(Pow(), example_args, {}, expected)
+    verify_model_numerically(Pow(), example_args, rtol=1e-6, atol=1e-6)
+
+
+def test_pow_integer_base_float_exponent():
+    class Pow(Module):
+        def forward(self, input):
+            return input.pow(3.0)
+
+    @tvm.script.ir_module
+    class expected:
+        @R.function
+        def main(input: R.Tensor((4,), dtype="int32")) -> R.Tuple(R.Tensor((4,), dtype="float32")):
+            with R.dataflow():
+                lv: R.Tensor((4,), dtype="float32") = R.astype(input, dtype="float32")
+                lv1: R.Tensor((4,), dtype="float32") = R.power(lv, R.const(3.0, "float32"))
+                gv: R.Tuple(R.Tensor((4,), dtype="float32")) = (lv1,)
+                R.output(gv)
+            return gv
+
+    example_args = (torch.tensor([-2, -1, 1, 2], dtype=torch.int32),)
+    verify_model(Pow(), example_args, {}, expected)
+    verify_model_numerically(Pow(), example_args)
 
 
 def test_logsoftmax():
