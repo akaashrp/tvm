@@ -84,6 +84,14 @@ def is_gemv(sch: s_tir.Schedule, block_info: SBlockInfo) -> list[tirx.Buffer] | 
     conditions.append(len(block_stmt.reads) >= 2)
     conditions.append(len(block_stmt.writes) == 1)
     conditions.append(get_reduction_expr(block_stmt) is not None)
+    block_iter_vars = {iter_var.var for iter_var in block_stmt.iter_vars}
+    conditions.append(
+        all(
+            len(collect_vars_used_in_prim_expr(dim.min) & block_iter_vars) <= 1
+            for region in [*block_stmt.reads, *block_stmt.writes]
+            for dim in region.region
+        )
+    )
     conditions.append(
         len(collect_block_iter_vars_used_in_access_region(block_stmt, block_stmt.writes[0].region))
         > 0

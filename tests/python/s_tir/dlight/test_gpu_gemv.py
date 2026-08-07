@@ -24,6 +24,54 @@ from tvm.script import tirx as T
 from tvm.target import Target
 
 
+def test_gemv_rejects_composite_symbolic_axis():
+    @T.prim_func(private=True, s_tir=True)
+    def before(p_a: T.handle, w: T.Buffer((512,), "float32"), p_c: T.handle, n: T.int64):
+        a = T.match_buffer(p_a, (n * T.int64(256) + T.int64(512),), "float32")
+        c = T.match_buffer(p_c, (n * T.int64(256),), "float32")
+        for i, k in T.grid(n * T.int64(256), 512):
+            with T.sblock("deconv_like"):
+                vi = T.axis.spatial(n * T.int64(256), i)
+                vk = T.axis.reduce(512, k)
+                T.reads(a[vi + vk], w[vk])
+                T.writes(c[vi])
+                with T.init():
+                    c[vi] = T.float32(0)
+                c[vi] = c[vi] + a[vi + vk] * w[vk]
+
+    mod = tvm.IRModule({"main": before})
+    with Target("apple/m1-gpu"):
+        scheduled = dl.ApplyDefaultSchedule(dl.gpu.GEMV())(mod)
+    tvm.ir.assert_structural_equal(scheduled["main"], before)
+
+
+def test_gemv_rejects_convolution_access():
+    @T.prim_func(private=True, s_tir=True)
+    def before(
+        var_x: T.handle,
+        weight: T.Buffer((8, 1, 5), "float16"),
+        n: T.int64,
+        var_y: T.handle,
+    ):
+        x = T.match_buffer(var_x, (1, 8, (n - 1) // 4 + 5), "float16")
+        y = T.match_buffer(var_y, (1, 8, (n - 1) // 4 + 1), "float16")
+        for nn, ff, yy, rc, ry in T.grid(1, 8, (n - 1) // 4 + 1, 1, 5):
+            with T.sblock("depthwise_conv1d"):
+                vnn, vff, vyy, vrc, vry = T.axis.remap("SSSRR", [nn, ff, yy, rc, ry])
+                T.reads(x[vnn, vff + vrc, vyy + vry], weight[vff, vrc, vry])
+                T.writes(y[vnn, vff, vyy])
+                with T.init():
+                    y[vnn, vff, vyy] = T.float16(0)
+                y[vnn, vff, vyy] = (
+                    y[vnn, vff, vyy] + x[vnn, vff + vrc, vyy + vry] * weight[vff, vrc, vry]
+                )
+
+    mod = tvm.IRModule({"main": before})
+    with Target("apple/m1-gpu"):
+        scheduled = dl.ApplyDefaultSchedule(dl.gpu.GEMV())(mod)
+    tvm.ir.assert_structural_equal(scheduled["main"], before)
+
+
 def test_gemv_basic():
     # fmt: off
     @T.prim_func(private=True, s_tir=True)

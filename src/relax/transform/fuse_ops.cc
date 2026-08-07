@@ -679,10 +679,27 @@ class FunctionCreator : public ExprMutator {
     if (const auto* tuple = expr.as<TupleNode>()) {
       return std::all_of(tuple->fields.begin(), tuple->fields.end(),
                          [this](const Expr& e) { return IsInlinableConstants(e); });
+    } else if (auto prim_value = expr.as<PrimExpr>()) {
+      ffi::Array<tirx::Var> undefined_vars = tvm::tirx::UndefinedVars(prim_value.value());
+      if (undefined_vars.empty()) {
+        return true;
+      }
+
+      // A symbolic value derived from an existing tensor/shape parameter is already part of the
+      // grouped function's shape environment.  Lifting it as an independent scalar parameter
+      // severs that relation, so type derivation can no longer retain output shapes that use it.
+      auto parameter_types =
+          TupleType(params_.Map([](const Var& param) { return GetType(param); }));
+      std::unordered_set<tirx::Var> parameter_shape_vars;
+      for (const tirx::Var& var : TIRVarsInType(parameter_types)) {
+        parameter_shape_vars.insert(var);
+      }
+      return std::all_of(undefined_vars.begin(), undefined_vars.end(),
+                         [&parameter_shape_vars](const tirx::Var& var) {
+                           return parameter_shape_vars.count(var);
+                         });
     } else if (expr.as<VarNode>() || expr.as<CallNode>()) {
       return false;
-    } else if (auto prim_value = expr.as<PrimExpr>()) {
-      return tvm::tirx::UndefinedVars(prim_value.value()).empty();
     } else if (const auto* shape_expr = expr.as<ShapeExprNode>()) {
       return std::all_of(shape_expr->values.begin(), shape_expr->values.end(),
                          [](const PrimExpr& e) { return tvm::tirx::UndefinedVars(e).empty(); });
