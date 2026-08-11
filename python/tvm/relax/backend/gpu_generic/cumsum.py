@@ -193,3 +193,43 @@ def gpu_2d_continuous_cumsum(
         update_cross_block(m, n, Tmp, Out, src_offset=0, out_offset=0)
 
     return cumsum
+
+
+def gpu_3d_axis_1_cumsum(
+    tx_len: int = 128,
+    in_dtype: str = "int32",
+    out_dtype: str | None = None,
+) -> PrimFunc:
+    """Generate a correctness fallback that scans axis 1 of a contiguous 3D tensor.
+
+    Each thread handles one pair of outer and inner indices and scans the
+    middle axis sequentially.  The dispatcher collapses arbitrary-rank inputs
+    around the scan axis into this 3D representation.  This fallback avoids a
+    transposed scan on targets where that lowering is unavailable; it is not a
+    parallel scan optimization for rank-3 tensors.
+    """
+
+    out_dtype = out_dtype or in_dtype
+    TX = T.int64(tx_len)
+
+    @T.prim_func(private=True, s_tir=True)
+    def cumsum(var_a: T.handle, var_out: T.handle):
+        T.func_attr({"tirx.is_scheduled": True})
+        outer, scan, inner = T.int64(), T.int64(), T.int64()
+        A = T.match_buffer(var_a, [outer, scan, inner], dtype=in_dtype)
+        Out = T.match_buffer(var_out, [outer, scan, inner], dtype=out_dtype)
+
+        for bx in T.thread_binding(T.ceildiv(outer * inner, TX), thread="blockIdx.x"):
+            for tx in T.thread_binding(TX, thread="threadIdx.x"):
+                row: T.let[T.int64] = bx * TX + tx
+                with T.sblock():
+                    accumulator = T.sblock_alloc_buffer((), out_dtype, scope="local")
+                    if row < outer * inner:
+                        outer_idx: T.let[T.int64] = row // inner
+                        inner_idx: T.let[T.int64] = row % inner
+                        accumulator[()] = T.Cast(out_dtype, 0)
+                        for k in T.serial(scan):
+                            accumulator[()] += T.Cast(out_dtype, A[outer_idx, k, inner_idx])
+                            Out[outer_idx, k, inner_idx] = accumulator[()]
+
+    return cumsum
