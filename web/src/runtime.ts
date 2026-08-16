@@ -1833,13 +1833,16 @@ export class Instance implements Disposable {
         );
         return await run();
       } finally {
-        if (frame !== undefined) {
-          this.releasePackedCall(frame);
-        }
-        callInProgress = false;
-        this.asyncifyCallInProgress = false;
-        if (disposeRequested) {
-          func.dispose();
+        try {
+          if (frame !== undefined) {
+            this.releasePackedCall(frame);
+          }
+        } finally {
+          callInProgress = false;
+          this.asyncifyCallInProgress = false;
+          if (disposeRequested) {
+            func.dispose();
+          }
         }
       }
     }) as AsyncPackedFunc;
@@ -2329,7 +2332,13 @@ export class Instance implements Disposable {
     // allocation can grow memory and detach them.
     const wasmByteSources = this.captureWasmByteSources(args);
     const stack = this.lib.getOrAllocCallStack();
+    let retainedCell: PackedFuncCell | undefined;
     try {
+      const handle = cell.getHandle();
+      this.lib.checkCall(
+        (this.exports.TVMFFIObjectIncRef as ctypes.FTVMFFIObjectIncRef)(handle)
+      );
+      retainedCell = new PackedFuncCell(handle, this.lib, this.ctx);
       const argsOffset = stack.allocRawBytes(SizeOf.TVMFFIAny * args.length);
       this.setPackedArguments(stack, args, argsOffset, wasmByteSources);
       const retOffset = stack.allocRawBytes(SizeOf.TVMFFIAny);
@@ -2339,7 +2348,7 @@ export class Instance implements Disposable {
       stack.storeI32(retOffset + SizeOf.I32, 0);
       stack.commitToWasmMemory();
       return {
-        cell,
+        cell: retainedCell,
         stack,
         argsOffset,
         numArgs: args.length,
@@ -2347,7 +2356,11 @@ export class Instance implements Disposable {
         released: false,
       };
     } catch (error) {
-      this.lib.recycleCallStack(stack);
+      try {
+        this.lib.recycleCallStack(stack);
+      } finally {
+        retainedCell?.dispose();
+      }
       throw error;
     }
   }
@@ -2373,7 +2386,11 @@ export class Instance implements Disposable {
   private releasePackedCall(frame: PackedCallFrame): void {
     if (!frame.released) {
       frame.released = true;
-      this.lib.recycleCallStack(frame.stack);
+      try {
+        this.lib.recycleCallStack(frame.stack);
+      } finally {
+        frame.cell.dispose();
+      }
     }
   }
 
