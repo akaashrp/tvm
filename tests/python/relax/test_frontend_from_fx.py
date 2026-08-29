@@ -2253,8 +2253,24 @@ def test_binary1(op, relax_op):
                 R.output(gv)
             return gv
 
+    @tvm.script.ir_module
+    class expected_power_identity:
+        @R.function
+        def main(
+            lhs: R.Tensor((1, 3, 10, 10), dtype="float32"),
+        ) -> R.Tensor((1, 3, 10, 10), dtype="float32"):
+            with R.dataflow():
+                gv: R.Tensor((1, 3, 10, 10), dtype="float32") = lhs
+                R.output(gv)
+            return gv
+
     verify_model(Binary1(op), input_info1, {}, expected_binary1)
-    verify_model(Binary2(op), input_info2, {}, expected_binary2)
+    verify_model(
+        Binary2(op),
+        input_info2,
+        {},
+        expected_power_identity if op is operator.pow else expected_binary2,
+    )
 
 
 operator_binary_2 = [
@@ -3578,9 +3594,8 @@ def test_pow_integer():
         def main(inp_0: R.Tensor((4,), dtype="int64")) -> R.Tensor((4,), dtype="int64"):
             with R.dataflow():
                 lv: R.Tensor((4,), dtype="int64") = R.multiply(inp_0, inp_0)
-                lv1: R.Tensor((4,), dtype="int64") = R.multiply(lv, inp_0)
-                lv2: R.Tensor((4,), dtype="int64") = R.multiply(lv1, inp_0)
-                gv: R.Tensor((4,), dtype="int64") = lv2
+                lv1: R.Tensor((4,), dtype="int64") = R.multiply(lv, lv)
+                gv: R.Tensor((4,), dtype="int64") = lv1
                 R.output(gv)
             return gv
 
@@ -5777,7 +5792,7 @@ def test_item():
         @R.function
         def main(inp_0: R.Tensor((1,), dtype="float32")) -> R.Tensor((), dtype="float32"):
             with R.dataflow():
-                lv: R.Tensor((), dtype="float32") = R.take(inp_0, R.const(0, "int64"), axis=0)
+                lv: R.Tensor((), dtype="float32") = R.take(inp_0, R.const(0, "int32"), axis=0)
                 gv: R.Tensor((), dtype="float32") = lv
                 R.output(gv)
             return gv
@@ -5826,7 +5841,7 @@ def test_select():
             inp_0: R.Tensor((5, 3), dtype="float32"),
         ) -> R.Tensor((3,), dtype="float32"):
             with R.dataflow():
-                lv: R.Tensor((3,), dtype="float32") = R.take(inp_0, R.const(1, "int64"), axis=0)
+                lv: R.Tensor((3,), dtype="float32") = R.take(inp_0, R.const(1, "int32"), axis=0)
                 gv: R.Tensor((3,), dtype="float32") = lv
                 R.output(gv)
             return gv

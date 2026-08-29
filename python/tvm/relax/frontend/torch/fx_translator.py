@@ -671,8 +671,10 @@ class TorchFXImporter(BaseFXGraphImporter):
     def _select(self, node: fx.Node) -> relax.Var:
         x = self.env[node.args[0]]
         dim = node.args[1]
-        index = relax.const(node.args[2], "int64")
-        return self.block_builder.emit(relax.op.take(x, index, dim))
+        index_value = node.args[2]
+        index = relax.const(index_value, "int32")
+        mode = "wrap" if index_value < 0 else "fast"
+        return self.block_builder.emit(relax.op.take(x, index, dim, mode=mode))
 
     def _size(self, node: fx.Node) -> relax.Expr:
         x = self.env[node.args[0]]

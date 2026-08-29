@@ -31,6 +31,8 @@
 #include <tvm/tirx/transform.h>
 
 #include <algorithm>
+#include <cmath>
+#include <cstdint>
 #include <limits>
 #include <optional>
 #include <string>
@@ -161,6 +163,16 @@ std::string CodeGenWebGPU::Finish() {
   }
   if (enable_subgroups_) {
     header_stream << "enable subgroups;\n\n";
+  }
+  if (emit_nonfinite_f32_) {
+    header_stream << "fn tvm_webgpu_bitcast_f32(value: u32) -> f32 {\n"
+                  << "  return bitcast<f32>(value);\n"
+                  << "}\n\n";
+  }
+  if (emit_nonfinite_f16_) {
+    header_stream << "fn tvm_webgpu_bitcast_f16(value: u32) -> f16 {\n"
+                  << "  return bitcast<vec2<f16>>(value).x;\n"
+                  << "}\n\n";
   }
   return header_stream.str() + decl_stream.str() + this->fwd_decl_stream.str() + stream.str();
 }
@@ -561,17 +573,41 @@ void CodeGenWebGPU::VisitExpr_(const IntImmNode* op, std::ostream& os) {  // NOL
 }
 
 void CodeGenWebGPU::VisitExpr_(const FloatImmNode* op, std::ostream& os) {  // NOLINT(*)
+  PrimType type = op->ty.as_or_throw<PrimType>();
+  if (std::isinf(op->value) || std::isnan(op->value)) {
+    uint32_t bits;
+    if (type.bits() == 32) {
+      emit_nonfinite_f32_ = true;
+      if (std::isnan(op->value)) {
+        bits = 0x7fc00000;
+      } else {
+        bits = std::signbit(op->value) ? 0xff800000 : 0x7f800000;
+      }
+      os << "tvm_webgpu_bitcast_f32(0x" << std::hex << bits << "u)" << std::dec;
+      return;
+    }
+    if (type.bits() == 16) {
+      enable_fp16_ = true;
+      emit_nonfinite_f16_ = true;
+      if (std::isnan(op->value)) {
+        bits = 0x7e007e00;
+      } else {
+        bits = std::signbit(op->value) ? 0xfc00fc00 : 0x7c007c00;
+      }
+      os << "tvm_webgpu_bitcast_f16(0x" << std::hex << bits << "u)" << std::dec;
+      return;
+    }
+  }
   std::ostringstream temp;
   temp << std::scientific << op->value;
-  if (op->ty.as_or_throw<PrimType>().bits() == 32) {
+  if (type.bits() == 32) {
     temp << 'f';
-  } else if (op->ty.as_or_throw<PrimType>().bits() == 16) {
+  } else if (type.bits() == 16) {
     // Using f16 requires enable directive
     enable_fp16_ = true;
     temp << 'h';
   } else {
-    TVM_FFI_THROW(InternalError) << "Unsupported floating point bits "
-                                 << op->ty.as_or_throw<PrimType>().bits();
+    TVM_FFI_THROW(InternalError) << "Unsupported floating point bits " << type.bits();
   }
   MarkConst(temp.str());
   os << temp.str();

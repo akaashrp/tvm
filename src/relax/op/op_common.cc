@@ -105,6 +105,47 @@ ffi::Array<TensorType> GetTensorTypeFromTuple(const Call& call, const BlockBuild
   return tensor_ty;
 }
 
+namespace {
+
+void CollectMultiplicativeFactors(const PrimExpr& expr, std::vector<PrimExpr>* factors) {
+  if (const auto* multiply = expr.as<te::MulNode>()) {
+    CollectMultiplicativeFactors(multiply->a, factors);
+    CollectMultiplicativeFactors(multiply->b, factors);
+  } else {
+    factors->push_back(expr);
+  }
+}
+
+bool CanProveEqualProduct(arith::AnalyzerObj* analyzer, const PrimExpr& lhs, const PrimExpr& rhs) {
+  if (analyzer->CanProveEqual(lhs, rhs)) {
+    return true;
+  }
+  std::vector<PrimExpr> lhs_factors;
+  std::vector<PrimExpr> rhs_factors;
+  CollectMultiplicativeFactors(lhs, &lhs_factors);
+  CollectMultiplicativeFactors(rhs, &rhs_factors);
+  if (lhs_factors.size() != rhs_factors.size()) {
+    return false;
+  }
+  std::vector<bool> matched(rhs_factors.size(), false);
+  for (const PrimExpr& lhs_factor : lhs_factors) {
+    bool found = false;
+    for (size_t index = 0; index < rhs_factors.size(); ++index) {
+      if (!matched[index] && analyzer->CanProveEqual(lhs_factor, rhs_factors[index])) {
+        matched[index] = true;
+        found = true;
+        break;
+      }
+    }
+    if (!found) {
+      return false;
+    }
+  }
+  return true;
+}
+
+}  // namespace
+
 BinaryBroadcastShapeInferResult InferBinaryBroadcastShape(arith::AnalyzerObj* analyzer,
                                                           const ffi::Array<PrimExpr>& x1_shape,
                                                           const ffi::Array<PrimExpr>& x2_shape) {
@@ -126,7 +167,7 @@ BinaryBroadcastShapeInferResult InferBinaryBroadcastShape(arith::AnalyzerObj* an
       output_shape.push_back(dim1);
     } else if (int_dim1 != nullptr && int_dim1->value == 1) {
       output_shape.push_back(dim0);
-    } else if (analyzer->CanProveEqual(dim0, dim1)) {
+    } else if (CanProveEqualProduct(analyzer, dim0, dim1)) {
       output_shape.push_back(dim0);
     } else if (int_dim0 && int_dim1 && int_dim0->value != int_dim1->value) {
       result.status = BinaryBroadcastShapeInferResult::Status::kConflict;

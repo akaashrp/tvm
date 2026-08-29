@@ -129,6 +129,13 @@ class BaseFXGraphImporter(metaclass=abc.ABCMeta):
             return tensor.shape
         raise ValueError(f"Unsupported type: {type(tensor)}")
 
+    def _shape_from_meta(self, node):
+        value = node.meta.get("val")
+        shape = getattr(value, "shape", None)
+        if shape is None or any(not isinstance(dim, int) for dim in shape):
+            return None
+        return list(shape)
+
     @staticmethod
     def _promote_common_dtype(lhs_dtype: str | None, rhs_dtype: str | None) -> str | None:
         """Return the promoted dtype following PyTorch rules, or None if unsupported."""
@@ -962,7 +969,7 @@ class BaseFXGraphImporter(metaclass=abc.ABCMeta):
                 output_padding=output_padding,
                 data_layout="NCW",
                 kernel_layout="IOW",
-                out_dtype="float32",
+                out_dtype=x.ty.dtype.dtype,
             )
         )
 
@@ -1016,7 +1023,7 @@ class BaseFXGraphImporter(metaclass=abc.ABCMeta):
                 output_padding=output_padding,
                 data_layout="NCHW",
                 kernel_layout="IOHW",
-                out_dtype="float32",
+                out_dtype=x.ty.dtype.dtype,
             )
         )
 
@@ -1068,7 +1075,7 @@ class BaseFXGraphImporter(metaclass=abc.ABCMeta):
                 groups=groups,
                 data_layout="NCW",
                 kernel_layout="OIW",
-                out_dtype="float32",
+                out_dtype=x.ty.dtype.dtype,
             )
         )
 
@@ -1117,7 +1124,7 @@ class BaseFXGraphImporter(metaclass=abc.ABCMeta):
                 groups=groups,
                 data_layout="NCHW",
                 kernel_layout="OIHW",
-                out_dtype="float32",
+                out_dtype=x.ty.dtype.dtype,
             )
         )
 
@@ -1156,6 +1163,8 @@ class BaseFXGraphImporter(metaclass=abc.ABCMeta):
         dilation: tuple | None,
         groups: tuple | None,
     ):
+        output_dtype = x.ty.dtype.dtype
+        accumulation_dtype = "float32" if output_dtype in ("float16", "bfloat16") else output_dtype
         conv3d = self.block_builder.emit(
             relax.op.nn.conv3d(
                 x,
@@ -1166,15 +1175,19 @@ class BaseFXGraphImporter(metaclass=abc.ABCMeta):
                 groups=groups,
                 data_layout="NCDHW",
                 kernel_layout="OIDHW",
-                out_dtype="float32",
+                out_dtype=accumulation_dtype,
             )
         )
 
-        if self._is_no_bias(bias):
-            return conv3d
-        assert len(self.shape_of(bias)) == 1
-        bias = relax.op.reshape(bias, (1, -1, 1, 1, 1))
-        return self.block_builder.emit(relax.op.add(conv3d, bias))
+        if not self._is_no_bias(bias):
+            assert len(self.shape_of(bias)) == 1
+            bias = relax.op.reshape(bias, (1, -1, 1, 1, 1))
+            if accumulation_dtype != output_dtype:
+                bias = self.block_builder.emit(relax.op.astype(bias, accumulation_dtype))
+            conv3d = self.block_builder.emit(relax.op.add(conv3d, bias))
+        if accumulation_dtype != output_dtype:
+            conv3d = self.block_builder.emit(relax.op.astype(conv3d, output_dtype))
+        return conv3d
 
     def _conv3d(self, node: fx.Node) -> relax.Var:
         args = self.retrieve_args(node)
@@ -1347,10 +1360,44 @@ class BaseFXGraphImporter(metaclass=abc.ABCMeta):
     def _layer_norm(self, node: fx.Node) -> relax.Var:
         x = self.env[node.args[0]]
         normalized_shape = node.args[1]
-        gamma = self.env[node.args[2]] if len(node.args) > 2 else None
-        beta = self.env[node.args[3]] if len(node.args) > 3 else None
+        gamma_arg = node.args[2] if len(node.args) > 2 else None
+        beta_arg = node.args[3] if len(node.args) > 3 else None
+        gamma = self.env[gamma_arg] if gamma_arg is not None else None
+        beta = self.env[beta_arg] if beta_arg is not None else None
         eps = node.args[4] if len(node.args) > 4 else 1e-05
         return self._layer_norm_impl(x, gamma, beta, eps, normalized_shape)
+
+    def _rms_norm(self, node: fx.Node) -> relax.Var:
+        x = self.env[node.args[0]]
+        normalized_shape = node.args[1]
+        weight_arg = node.args[2] if len(node.args) > 2 else None
+        weight = self.env[weight_arg] if weight_arg is not None else None
+        eps = node.args[3] if len(node.args) > 3 else None
+        axes = list(range(-len(normalized_shape), 0))
+        output_dtype = x.ty.dtype.dtype
+        compute_dtype = "float32" if output_dtype in ("float16", "bfloat16") else output_dtype
+        if eps is None:
+            eps = {
+                "float16": 2**-10,
+                "bfloat16": 2**-7,
+                "float32": 2**-23,
+                "float64": 2**-52,
+            }[output_dtype]
+        if output_dtype in ("float16", "bfloat16"):
+            x = self.block_builder.emit(relax.op.astype(x, compute_dtype))
+            if weight is not None:
+                weight = self.block_builder.emit(relax.op.astype(weight, compute_dtype))
+        squared = self.block_builder.emit(relax.op.multiply(x, x))
+        variance = self.block_builder.emit(relax.op.mean(squared, axis=axes, keepdims=True))
+        inverse_rms = self.block_builder.emit(
+            relax.op.rsqrt(relax.op.add(variance, relax.const(eps, compute_dtype)))
+        )
+        normalized = self.block_builder.emit(relax.op.multiply(x, inverse_rms))
+        if weight is not None:
+            normalized = self.block_builder.emit(relax.op.multiply(normalized, weight))
+        if output_dtype in ("float16", "bfloat16"):
+            normalized = self.block_builder.emit(relax.op.astype(normalized, output_dtype))
+        return normalized
 
     def _layer_norm_module(self, node: fx.Node) -> relax.Var:
         import torch  # type: ignore
@@ -1372,7 +1419,16 @@ class BaseFXGraphImporter(metaclass=abc.ABCMeta):
         x = args[0]
         weight = args[1]
         bias = args[2] if len(args) > 2 else None
-        return self.block_builder.emit(relax.op.linear(x, weight, bias, "float32"))
+        output_dtype = x.ty.dtype.dtype
+        if output_dtype not in ("float16", "bfloat16"):
+            return self.block_builder.emit(relax.op.linear(x, weight, bias, output_dtype))
+
+        weight = self.block_builder.emit(relax.op.permute_dims(weight, axes=None))
+        result = self.block_builder.emit(relax.op.matmul(x, weight, out_dtype="float32"))
+        if bias is not None:
+            bias = self.block_builder.emit(relax.op.astype(bias, "float32"))
+            result = self.block_builder.emit(relax.op.add(result, bias))
+        return self.block_builder.emit(relax.op.astype(result, output_dtype))
 
     def _max_pool1d_impl(
         self,
@@ -1601,6 +1657,11 @@ class BaseFXGraphImporter(metaclass=abc.ABCMeta):
         query_tensor = self.env[node.args[0]]
         key_tensor = self.env[node.args[1]]
         value_tensor = self.env[node.args[2]]
+        output_dtype = query_tensor.ty.dtype.dtype
+        if output_dtype in ("float16", "bfloat16"):
+            query_tensor = self.block_builder.emit(relax.op.astype(query_tensor, "float32"))
+            key_tensor = self.block_builder.emit(relax.op.astype(key_tensor, "float32"))
+            value_tensor = self.block_builder.emit(relax.op.astype(value_tensor, "float32"))
 
         # Check the dimensionality of the input tensors
         query_ndim = len(query_tensor.ty.shape)
@@ -1651,12 +1712,19 @@ class BaseFXGraphImporter(metaclass=abc.ABCMeta):
             attn_mask = self.env[attn_mask]
             msg = "Only a float mask is supported for the attn_mask input."
             assert attn_mask.ty.dtype.matches_code(DataTypeCode.FLOAT, DataTypeCode.BFLOAT), msg
+            if output_dtype in ("float16", "bfloat16"):
+                attn_mask = self.block_builder.emit(relax.op.astype(attn_mask, "float32"))
 
         attention_output = self.block_builder.emit(
             relax.op.nn.attention(query, key, value, bias=attn_mask, causal_mask=causal_mask)
         )
 
-        return transpose_and_reshape_back(attention_output)
+        attention_output = transpose_and_reshape_back(attention_output)
+        if output_dtype in ("float16", "bfloat16"):
+            attention_output = self.block_builder.emit(
+                relax.op.astype(attention_output, output_dtype)
+            )
+        return attention_output
 
     def _unbind(self, node: fx.Node) -> relax.Var:
         x = self.env[node.args[0]]
@@ -1860,8 +1928,14 @@ class BaseFXGraphImporter(metaclass=abc.ABCMeta):
 
     def _where(self, node: fx.Node) -> relax.Var:
         condition = self.env[node.args[0]]
-        x = self.env[node.args[1]]
-        y = self.env[node.args[2]]
+        x = self.env[node.args[1]] if node.args[1] in self.env else node.args[1]
+        y = self.env[node.args[2]] if node.args[2] in self.env else node.args[2]
+        if not isinstance(x, relax.Expr) or not isinstance(y, relax.Expr):
+            output_dtype = self._convert_data_type(node.meta["val"].dtype)
+            if not isinstance(x, relax.Expr):
+                x = relax.const(x, output_dtype)
+            if not isinstance(y, relax.Expr):
+                y = relax.const(y, output_dtype)
         return self.block_builder.emit(relax.op.where(condition, x, y))
 
     def _bucketize(self, node: fx.Node) -> relax.Var:
@@ -1983,6 +2057,11 @@ class BaseFXGraphImporter(metaclass=abc.ABCMeta):
         x = self.env[node.args[0]]
         start_dim = node.args[1] if len(node.args) >= 2 else node.kwargs.get("start_dim", 0)
         end_dim = node.args[2] if len(node.args) == 3 else node.kwargs.get("end_dim", -1)
+        if self.shape_of(x) is None:
+            output_shape = self._shape_from_meta(node)
+            if output_shape is None:
+                raise ValueError("Cannot infer the output shape of flatten")
+            return self.block_builder.emit(relax.op.reshape(x, output_shape))
         return self._flatten_impl(x, start_dim, end_dim)
 
     def _flip(self, node: fx.Node) -> relax.Var:
@@ -2311,6 +2390,13 @@ class BaseFXGraphImporter(metaclass=abc.ABCMeta):
         args = self.retrieve_args(node)
         x = args[0]
         dims = args[1] if isinstance(args[1], torch.Size | tuple | list) else args[1:]
+
+        if any(isinstance(dim, int) and dim == -1 for dim in dims):
+            output_shape = self._shape_from_meta(node)
+            if output_shape is not None and (
+                self.shape_of(x) is None or any(not isinstance(dim, int) for dim in output_shape)
+            ):
+                dims = output_shape
 
         # Skip identity reshape
         current_shape = self.shape_of(x)
@@ -2869,7 +2955,7 @@ class BaseFXGraphImporter(metaclass=abc.ABCMeta):
                 self.block_builder.match_cast(shape_value, relax.ShapeType([dim]))
                 return dim
             return x
-        return self.block_builder.emit(relax.op.take(x, relax.const(0, "int64"), axis=0))
+        return self.block_builder.emit(relax.op.take(x, relax.const(0, "int32"), axis=0))
 
     def _sym_size_int(self, node: fx.Node) -> relax.Expr:
         x = self.env[node.args[0]]

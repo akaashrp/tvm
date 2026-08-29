@@ -62,13 +62,22 @@ def verify_model(
     tvm.ir.assert_structural_equal(mod, expected, map_free_vars=map_free_vars)
 
 
-def verify_model_numerically(torch_model, example_args, rtol=1e-7, atol=1e-7):
+def verify_model_numerically(
+    torch_model,
+    example_args,
+    rtol=1e-7,
+    atol=1e-7,
+    run_ep_decomposition=True,
+):
     """Verify model by comparing numerical outputs between PyTorch and TVM."""
     with torch.no_grad():
         pytorch_output = torch_model(*example_args)
 
     exported_program = export(torch_model, args=example_args)
-    mod = from_exported_program(exported_program)
+    mod = from_exported_program(
+        exported_program,
+        run_ep_decomposition=run_ep_decomposition,
+    )
     target = tvm.target.Target("llvm")
     ex = relax.build(mod, target)
     vm = relax.VirtualMachine(ex, tvm.cpu())
@@ -493,12 +502,12 @@ def test_extended_unary_ops():
             R.Tensor((1, 3, 10, 10), dtype="bool")
         ):
             with R.dataflow():
-                lv: R.Tensor((1, 3, 10, 10), dtype="float32") = R.abs(input)
-                lv1: R.Tensor((1, 3, 10, 10), dtype="bool") = R.not_equal(
-                    lv, R.const(float("inf"), "float32")
+                lv: R.Tensor((1, 3, 10, 10), dtype="bool") = R.equal(input, input)
+                lv1: R.Tensor((1, 3, 10, 10), dtype="float32") = R.abs(input)
+                lv2: R.Tensor((1, 3, 10, 10), dtype="bool") = R.not_equal(
+                    lv1, R.const(float("inf"), "float32")
                 )
-                lv2: R.Tensor((1, 3, 10, 10), dtype="bool") = R.equal(input, input)
-                lv3: R.Tensor((1, 3, 10, 10), dtype="bool") = R.multiply(lv2, lv1)
+                lv3: R.Tensor((1, 3, 10, 10), dtype="bool") = R.multiply(lv, lv2)
                 gv: R.Tuple(R.Tensor((1, 3, 10, 10), dtype="bool")) = (lv3,)
                 R.output(gv)
             return gv
@@ -906,12 +915,12 @@ def test_logaddexp():
                 lv: R.Tensor((1, 3, 10, 10), dtype="bool") = R.greater_equal(input1, input2)
                 lv1: R.Tensor((1, 3, 10, 10), dtype="float32") = R.where(lv, input1, input2)
                 lv2: R.Tensor((1, 3, 10, 10), dtype="float32") = R.where(lv, input2, input1)
-                lv3: R.Tensor((1, 3, 10, 10), dtype="float32") = R.abs(input1)
-                lv4: R.Tensor((1, 3, 10, 10), dtype="bool") = R.not_equal(
-                    lv3, R.const(float("inf"), "float32")
+                lv3: R.Tensor((1, 3, 10, 10), dtype="bool") = R.equal(input1, input1)
+                lv4: R.Tensor((1, 3, 10, 10), dtype="float32") = R.abs(input1)
+                lv5: R.Tensor((1, 3, 10, 10), dtype="bool") = R.not_equal(
+                    lv4, R.const(float("inf"), "float32")
                 )
-                lv5: R.Tensor((1, 3, 10, 10), dtype="bool") = R.equal(input1, input1)
-                lv6: R.Tensor((1, 3, 10, 10), dtype="bool") = R.multiply(lv5, lv4)
+                lv6: R.Tensor((1, 3, 10, 10), dtype="bool") = R.multiply(lv3, lv5)
                 lv7: R.Tensor((1, 3, 10, 10), dtype="bool") = R.logical_not(lv6)
                 lv8: R.Tensor((1, 3, 10, 10), dtype="bool") = R.equal(input1, input2)
                 lv9: R.Tensor((1, 3, 10, 10), dtype="bool") = R.logical_and(lv7, lv8)
@@ -1427,10 +1436,26 @@ def test_binary1(op, relax_op):
                 R.output(gv)
             return gv
 
+    @tvm.script.ir_module
+    class expected_power_identity:
+        @R.function
+        def main(
+            lhs: R.Tensor((10, 10), dtype="float32"),
+        ) -> R.Tuple(R.Tensor((10, 10), dtype="float32")):
+            with R.dataflow():
+                gv: R.Tuple(R.Tensor((10, 10), dtype="float32")) = (lhs,)
+                R.output(gv)
+            return gv
+
     # In-place ops (add_, mul_, ...) produce the same Relax program as their
     # functional counterparts: mutation outputs are dropped by the importer.
     verify_model(Binary1(op), example_args1, {}, expected_binary1)
-    verify_model(Binary2(op), example_args2, {}, expected_binary2)
+    verify_model(
+        Binary2(op),
+        example_args2,
+        {},
+        expected_power_identity if op is operator.pow else expected_binary2,
+    )
 
 
 operator_binary_scalar = [
@@ -3044,6 +3069,44 @@ def test_conv3d():
     verify_model(model, example_args, binding, expected2)
 
 
+def test_float16_conv3d_and_linear_use_expected_accumulation_dtype():
+    class Model(Module):
+        def __init__(self):
+            super().__init__()
+            self.conv = torch.nn.Conv3d(2, 4, 1)
+            self.projection = torch.nn.Linear(4, 3)
+
+        def forward(self, x):
+            convolved = self.conv(x)
+            projected = self.projection(convolved.permute(0, 2, 3, 4, 1))
+            return projected
+
+    model = Model().half().eval()
+    exported_program = export(
+        model,
+        args=(torch.randn(1, 2, 2, 3, 4, dtype=torch.float16),),
+        strict=False,
+    )
+    mod = from_exported_program(
+        exported_program,
+        keep_params_as_input=True,
+        run_ep_decomposition=False,
+    )
+
+    calls = []
+    relax.analysis.post_order_visit(
+        mod["main"],
+        lambda expr: calls.append(expr) if isinstance(expr, relax.Call) else None,
+    )
+    convolution = next(call for call in calls if call.op.name == "relax.nn.conv3d")
+    linear = next(call for call in calls if call.op.name == "relax.matmul")
+    casts = [call for call in calls if call.op.name == "relax.astype"]
+    assert convolution.attrs.out_dtype == "float32"
+    assert linear.attrs.out_dtype == "float32"
+    assert any(cast.attrs.dtype == "float16" for cast in casts)
+    assert mod["main"].ret_ty.fields[0].dtype == "float16"
+
+
 def test_pad():
     class PadModel(torch.nn.Module):
         def __init__(self, pad, mode="constant", value=0.0):
@@ -3588,6 +3651,58 @@ def test_layernorm():
     verify_model(LayerNorm(), example_args, binding, expected1)
 
 
+def test_layernorm_without_affine_parameters():
+    model = torch.nn.LayerNorm((4,), elementwise_affine=False)
+    example_args = (torch.randn(2, 3, 4, dtype=torch.float32),)
+    verify_model_numerically(
+        model,
+        example_args,
+        rtol=1e-6,
+        atol=1e-6,
+        run_ep_decomposition=False,
+    )
+
+
+def test_rms_norm():
+    model = torch.nn.RMSNorm((4,), eps=1e-6)
+
+    @tvm.script.ir_module
+    class expected:
+        @R.function
+        def main(
+            input_1: R.Tensor((2, 3, 4), dtype="float32"),
+            weight: R.Tensor((4,), dtype="float32"),
+        ) -> R.Tuple(R.Tensor((2, 3, 4), dtype="float32")):
+            with R.dataflow():
+                lv = R.multiply(input_1, input_1)
+                lv1 = R.mean(lv, axis=[-1], keepdims=True)
+                lv2 = R.add(
+                    lv1,
+                    R.const(9.9999999747524271e-07, "float32"),
+                )
+                lv3 = R.rsqrt(lv2)
+                lv4 = R.multiply(input_1, lv3)
+                lv5 = R.multiply(lv4, weight)
+                gv: R.Tuple(R.Tensor((2, 3, 4), dtype="float32")) = (lv5,)
+                R.output(gv)
+            return gv
+
+    verify_model(
+        model,
+        (torch.randn(2, 3, 4),),
+        {"weight": model.weight.detach().numpy()},
+        expected,
+        run_ep_decomposition=False,
+    )
+    verify_model_numerically(
+        torch.nn.RMSNorm((4,), elementwise_affine=False),
+        (torch.randn(2, 3, 4),),
+        rtol=1e-6,
+        atol=1e-6,
+        run_ep_decomposition=False,
+    )
+
+
 def test_linear():
     class Dense1(Module):
         def __init__(self):
@@ -3988,6 +4103,50 @@ def test_maxpool3d():
     verify_model(MaxPool3d_functional(), example_args1, {}, expected1)
     verify_model(MaxPool3d2(), example_args2, {}, expected2)
     verify_model(MaxPool3d3(), example_args3, {}, expected3)
+
+
+def test_scaled_dot_product_attention_fp16_uses_fp32_compute():
+    class Attention(Module):
+        def forward(self, q, k, v):
+            return torch.nn.functional.scaled_dot_product_attention(q, k, v)
+
+    @I.ir_module
+    class Expected:
+        @R.function
+        def main(
+            q: R.Tensor((1, 2, 4, 8), dtype="float16"),
+            k: R.Tensor((1, 2, 4, 8), dtype="float16"),
+            v: R.Tensor((1, 2, 4, 8), dtype="float16"),
+        ) -> R.Tuple(R.Tensor((1, 2, 4, 8), dtype="float16")):
+            with R.dataflow():
+                lv = R.astype(q, dtype="float32")
+                lv1 = R.astype(k, dtype="float32")
+                lv2 = R.astype(v, dtype="float32")
+                lv3 = R.permute_dims(lv, axes=[0, 2, 1, 3])
+                lv4 = R.permute_dims(lv1, axes=[0, 2, 1, 3])
+                lv5 = R.permute_dims(lv2, axes=[0, 2, 1, 3])
+                lv6 = R.nn.attention(
+                    lv3,
+                    lv4,
+                    lv5,
+                    scale=None,
+                    causal_mask=None,
+                    window_size=None,
+                )
+                lv7 = R.permute_dims(lv6, axes=[0, 2, 1, 3])
+                lv8 = R.astype(lv7, dtype="float16")
+                gv = (lv8,)
+                R.output(gv)
+            return gv
+
+    inputs = tuple(torch.randn(1, 2, 4, 8, dtype=torch.float16) for _ in range(3))
+    verify_model(
+        Attention(),
+        inputs,
+        {},
+        Expected,
+        run_ep_decomposition=False,
+    )
 
 
 def test_scaled_dot_product_attention():
@@ -5406,7 +5565,7 @@ def test_select_slice():
             # block 0
             with R.dataflow():
                 lv: R.Tensor((3, 10, 10), dtype="float32") = R.take(
-                    x, R.const(0, "int64"), axis=0, mode="fast"
+                    x, R.const(0, "int32"), axis=0, mode="fast"
                 )
                 lv1: R.Tensor((1, 10, 10), dtype="float32") = R.strided_slice(
                     lv,
@@ -5606,6 +5765,56 @@ def test_derived_input_dimension_without_exported_program_decomposition():
     x_shape = mod["main"].params[0].ty.shape.values
     y_shape = mod["main"].params[1].ty.shape.values
     assert tvm.arith.Analyzer().can_prove_equal(y_shape[1], x_shape[1] * 2)
+
+
+def test_dynamic_patch_flatten_without_exported_program_decomposition():
+    class DynamicPatch(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.projection = torch.nn.Conv3d(
+                4,
+                8,
+                kernel_size=(1, 2, 2),
+                stride=(1, 2, 2),
+            )
+
+        def forward(self, x):
+            frames = x.shape[2]
+            height = x.shape[3] // 2
+            width = x.shape[4] // 2
+            patched = self.projection(x).flatten(2).transpose(1, 2)
+            patched = patched.unflatten(2, (2, 4)).flatten(2, 3)
+            return patched.reshape(1, frames, height, width, -1)
+
+    frames = torch.export.Dim("frames", min=1, max=4)
+    patch_height = torch.export.Dim("patch_height", min=1, max=4)
+    patch_width = torch.export.Dim("patch_width", min=1, max=4)
+    exported_program = export(
+        DynamicPatch(),
+        args=(torch.randn(1, 4, 3, 4, 6),),
+        dynamic_shapes={
+            "x": {
+                2: frames,
+                3: 2 * patch_height,
+                4: 2 * patch_width,
+            }
+        },
+        strict=False,
+    )
+    mod = from_exported_program(
+        exported_program,
+        keep_params_as_input=True,
+        run_ep_decomposition=False,
+    )
+
+    output_shape = mod["main"].ret_ty.fields[0].shape.values
+    input_shape = mod["main"].params[0].ty.shape.values
+    analyzer = tvm.arith.Analyzer()
+    assert analyzer.can_prove_equal(output_shape[1], input_shape[2])
+    assert analyzer.can_prove_equal(output_shape[2], tvm.tirx.floordiv(input_shape[3], 2))
+    assert analyzer.can_prove_equal(output_shape[3], tvm.tirx.floordiv(input_shape[4], 2))
+    assert analyzer.can_prove_equal(output_shape[4], 8)
+    assert relax.analysis.check_well_formed(mod)
 
 
 def test_expand_with_new_leading_dimension():
@@ -6690,7 +6899,7 @@ def test_type_as():
 def test_select():
     class Select(Module):
         def forward(self, input):
-            return torch.select(input, 0, 1)
+            return torch.select(input, 0, -1)
 
     @tvm.script.ir_module
     class Expected:
@@ -6699,7 +6908,9 @@ def test_select():
             inp_0: R.Tensor((2, 3), dtype="float32"),
         ) -> R.Tuple(R.Tensor((3,), dtype="float32")):
             with R.dataflow():
-                lv: R.Tensor((3,), dtype="float32") = R.take(inp_0, R.const(1, "int64"), axis=0)
+                lv: R.Tensor((3,), dtype="float32") = R.take(
+                    inp_0, R.const(-1, "int32"), axis=0, mode="wrap"
+                )
                 gv: R.Tuple(R.Tensor((3,), dtype="float32")) = (lv,)
                 R.output(gv)
             return gv
@@ -7532,6 +7743,17 @@ def test_where():
     verify_model(Where(), (condition, x, y), {}, Expected)
 
 
+def test_where_scalar():
+    class WhereScalar(Module):
+        def forward(self, input):
+            return torch.where(input > 0.5, 1.0, 0.0)
+
+    input = torch.tensor([[0.25, 0.75], [1.0, 0.0]], dtype=torch.float32)
+    exported_program = export(WhereScalar(), args=(input,))
+    assert any("where.Scalar" in str(node.target) for node in exported_program.graph.nodes)
+    verify_model_numerically(WhereScalar(), (input,), rtol=0, atol=0)
+
+
 def test_bucketize():
     class Bucketize(Module):
         def forward(self, input_tensor, boundaries):
@@ -7721,7 +7943,7 @@ def test_item():
         @R.function
         def main(input: R.Tensor((1,), dtype="float32")) -> R.Tuple(R.Tensor((), dtype="float32")):
             with R.dataflow():
-                lv: R.Tensor((), dtype="float32") = R.take(input, R.const(0, "int64"), axis=0)
+                lv: R.Tensor((), dtype="float32") = R.take(input, R.const(0, "int32"), axis=0)
                 gv: R.Tuple(R.Tensor((), dtype="float32")) = (lv,)
                 R.output(gv)
             return gv
@@ -8268,19 +8490,18 @@ def test_dynamic_shape_with_addition_constraints():
     class Expected:
         @R.function
         def main(
-            x: R.Tensor(("s0", 4), dtype="float32"), y: R.Tensor(("s0___1", 4), dtype="float32")
-        ) -> R.Tuple(R.Tensor(("s0 + s0___1", 4), dtype="float32")):
+            x: R.Tensor(("s0", 4), dtype="float32"), y: R.Tensor(("1 + s0", 4), dtype="float32")
+        ) -> R.Tuple(R.Tensor(("s0 + (1 + s0)", 4), dtype="float32")):
             s0 = T.int64()
-            s0___1 = T.int64()
             R.func_attr(
                 {
-                    "tir_var_lower_bound": {"s77": 1, "s77___1": 2},
-                    "tir_var_upper_bound": {"s77": 64, "s77___1": 65},
+                    "tir_var_lower_bound": {"s77": 1},
+                    "tir_var_upper_bound": {"s77": 64},
                 }
             )
             with R.dataflow():
-                lv: R.Tensor((s0 + s0___1, 4), dtype="float32") = R.concat((x, y), axis=0)
-                gv: R.Tuple(R.Tensor((s0 + s0___1, 4), dtype="float32")) = (lv,)
+                lv: R.Tensor((s0 + (1 + s0), 4), dtype="float32") = R.concat((x, y), axis=0)
+                gv: R.Tuple(R.Tensor((s0 + (1 + s0), 4), dtype="float32")) = (lv,)
                 R.output(gv)
             return gv
 
@@ -8302,19 +8523,18 @@ def test_dynamic_shape_with_subtraction_constraints():
     class Expected:
         @R.function
         def main(
-            x: R.Tensor(("s0___1", 4), dtype="float32"), y: R.Tensor(("s0", 4), dtype="float32")
-        ) -> R.Tuple(R.Tensor(("s0___1 + s0", 4), dtype="float32")):
-            s0___1 = T.int64()
+            x: R.Tensor(("1 + s0", 4), dtype="float32"), y: R.Tensor(("s0", 4), dtype="float32")
+        ) -> R.Tuple(R.Tensor(("1 + s0 + s0", 4), dtype="float32")):
             s0 = T.int64()
             R.func_attr(
                 {
-                    "tir_var_lower_bound": {"s17": 0, "s17___1": 1},
-                    "tir_var_upper_bound": {"s17": 63, "s17___1": 64},
+                    "tir_var_lower_bound": {"s17": 0},
+                    "tir_var_upper_bound": {"s17": 63},
                 }
             )
             with R.dataflow():
-                lv: R.Tensor((s0___1 + s0, 4), dtype="float32") = R.concat((x, y), axis=0)
-                gv: R.Tuple(R.Tensor((s0___1 + s0, 4), dtype="float32")) = (lv,)
+                lv: R.Tensor((1 + s0 + s0, 4), dtype="float32") = R.concat((x, y), axis=0)
+                gv: R.Tuple(R.Tensor((1 + s0 + s0, 4), dtype="float32")) = (lv,)
                 R.output(gv)
             return gv
 
@@ -8336,19 +8556,18 @@ def test_dynamic_shape_with_multiplication_constraints():
     class Expected:
         @R.function
         def main(
-            x: R.Tensor(("s0", 4), dtype="float32"), y: R.Tensor(("s0_2", 4), dtype="float32")
-        ) -> R.Tuple(R.Tensor(("s0 + s0_2", 4), dtype="float32")):
+            x: R.Tensor(("s0", 4), dtype="float32"), y: R.Tensor(("2 * s0", 4), dtype="float32")
+        ) -> R.Tuple(R.Tensor(("s0 + 2 * s0", 4), dtype="float32")):
             s0 = T.int64()
-            s0_2 = T.int64()
             R.func_attr(
                 {
-                    "tir_var_lower_bound": {"s77": 1, "s77_2": 2},
-                    "tir_var_upper_bound": {"s77": 64, "s77_2": 128},
+                    "tir_var_lower_bound": {"s77": 1},
+                    "tir_var_upper_bound": {"s77": 64},
                 }
             )
             with R.dataflow():
-                lv: R.Tensor((s0 + s0_2, 4), dtype="float32") = R.concat((x, y), axis=0)
-                gv: R.Tuple(R.Tensor((s0 + s0_2, 4), dtype="float32")) = (lv,)
+                lv: R.Tensor((s0 + 2 * s0, 4), dtype="float32") = R.concat((x, y), axis=0)
+                gv: R.Tuple(R.Tensor((s0 + 2 * s0, 4), dtype="float32")) = (lv,)
                 R.output(gv)
             return gv
 
@@ -8703,6 +8922,52 @@ def test_upsample_nearest2d():
 
     verify_model(UpsampleNearest2dScale(), example_args, {}, expected_scale)
     verify_model(UpsampleNearest2dSize(), example_args, {}, expected_size)
+
+
+def test_upsample_nearest_exact2d():
+    class UpsampleNearestExact2d(Module):
+        def forward(self, input):
+            return torch.nn.functional.interpolate(
+                input,
+                size=(5, 7),
+                mode="nearest-exact",
+            )
+
+    example_args = (torch.arange(12, dtype=torch.float32).reshape(1, 1, 3, 4),)
+    exported_program = export(UpsampleNearestExact2d(), args=example_args)
+    assert any(
+        "_upsample_nearest_exact2d.vec" in str(node.target) for node in exported_program.graph.nodes
+    )
+    verify_model_numerically(
+        UpsampleNearestExact2d(),
+        example_args,
+        rtol=0,
+        atol=0,
+        run_ep_decomposition=False,
+    )
+
+
+def test_upsample_nearest_exact3d():
+    class UpsampleNearestExact3d(Module):
+        def forward(self, input):
+            return torch.nn.functional.interpolate(
+                input,
+                size=(2, 5, 7),
+                mode="nearest-exact",
+            )
+
+    example_args = (torch.arange(24, dtype=torch.float32).reshape(1, 1, 2, 3, 4),)
+    exported_program = export(UpsampleNearestExact3d(), args=example_args)
+    assert any(
+        "_upsample_nearest_exact3d.vec" in str(node.target) for node in exported_program.graph.nodes
+    )
+    verify_model_numerically(
+        UpsampleNearestExact3d(),
+        example_args,
+        rtol=0,
+        atol=0,
+        run_ep_decomposition=False,
+    )
 
 
 def test_from_exported_program_sparse_csr_buffer():

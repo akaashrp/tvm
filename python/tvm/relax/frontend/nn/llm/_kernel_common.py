@@ -463,13 +463,33 @@ def _get_prefill_kernel_config(h_kv, h_q, d, dtype, target: Target):
     while (tile_x * tile_y) % (bdx * num_warps) != 0:
         tile_y += original_tile_y
 
-    # Otherwise we would exceed maxComputeWorkgroupStorageSize
-    if (
-        target.kind.name == "webgpu"
-        and ((d + 127) // 128) * ((DataType(dtype).bits + 15) // 16) >= 4
-    ):
-        tile_z = 8
-        num_warps = 2
+    if target.kind.name == "webgpu":
+        dtype_bytes = (DataType(dtype).bits + 7) // 8
+        shared_memory_limit = int(target.attrs["max_shared_memory_per_block"])
+
+        def shared_memory_bytes():
+            qkv = (tile_x + 2 * tile_z) * d * dtype_bytes
+            softmax = (tile_x * tile_z + 4 * tile_x) * 4
+            return qkv + softmax
+
+        while shared_memory_bytes() > shared_memory_limit:
+            if tile_z > 4 and 2 * tile_z >= tile_x:
+                tile_z //= 2
+            elif tile_x > 4:
+                tile_x //= 2
+            else:
+                raise ValueError(
+                    f"attention head dimension {d} requires more than "
+                    f"{shared_memory_limit} bytes of WebGPU workgroup storage"
+                )
+        threads = min(bdx * num_warps, tile_x * tile_z)
+        while any(
+            extent % threads != 0
+            for extent in (tile_x * tile_z, tile_x * tile_y, tile_z * tile_y)
+        ):
+            threads //= 2
+        bdx = min(bdx, threads)
+        num_warps = threads // bdx
     if target.kind.name == "opencl" and (
         ("android" in str(target.host)) or ("adreno" in str(target.attrs))
     ):

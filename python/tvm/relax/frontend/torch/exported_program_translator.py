@@ -298,8 +298,12 @@ class ExportedProgramImporter(BaseFXGraphImporter):
         scale_factor,
         method: str,
         align_corners: bool,
+        coordinate_transformation_mode: str | None = None,
+        rounding_method: str | None = None,
     ) -> relax.Var:
-        coord_trans = "align_corners" if align_corners else "half_pixel"
+        coord_trans = coordinate_transformation_mode or (
+            "align_corners" if align_corners else "half_pixel"
+        )
 
         if size is None:
             shape = self.shape_of(x)
@@ -312,9 +316,27 @@ class ExportedProgramImporter(BaseFXGraphImporter):
             else:
                 size = tuple(int(shape[i].value * scale_factor) for i in range(2, len(shape)))
 
+        rank = len(self.shape_of(x))
+        if rank == 5:
+            return self.block_builder.emit(
+                relax.op.image.resize3d(
+                    x,
+                    size,
+                    layout="NCDHW",
+                    method=method,
+                    coordinate_transformation_mode=coord_trans,
+                    rounding_method=rounding_method or "",
+                )
+            )
+        assert rank == 4
         return self.block_builder.emit(
             relax.op.image.resize2d(
-                x, size, layout="NCHW", method=method, coordinate_transformation_mode=coord_trans
+                x,
+                size,
+                layout="NCHW",
+                method=method,
+                coordinate_transformation_mode=coord_trans,
+                rounding_method=rounding_method or "round",
             )
         )
 
@@ -373,6 +395,31 @@ class ExportedProgramImporter(BaseFXGraphImporter):
             method="nearest_neighbor",
             align_corners=align_corners,
         )
+
+    def _upsample_nearest_exact2d(self, node: fx.node) -> relax.Var:
+        x = self.env[node.args[0]]
+        size = node.args[1] if len(node.args) > 1 else node.kwargs.get("size", None)
+        if size:
+            scale_factor = None
+        else:
+            scale_factor = (
+                node.args[2] if len(node.args) > 2 else node.kwargs.get("scale_factor", 1)
+            )
+        return self._upsample_impl(
+            x,
+            size=size,
+            scale_factor=scale_factor,
+            method="nearest_neighbor",
+            align_corners=False,
+            coordinate_transformation_mode="tf_half_pixel_for_nn",
+            rounding_method="floor",
+        )
+
+    def _upsample_nearest3d(self, node: fx.node) -> relax.Var:
+        return self._upsample_nearest2d(node)
+
+    def _upsample_nearest_exact3d(self, node: fx.node) -> relax.Var:
+        return self._upsample_nearest_exact2d(node)
 
     def _upsample_bicubic2d(self, node: fx.node) -> relax.Var:
         x = self.env[node.args[0]]
@@ -1124,8 +1171,10 @@ class ExportedProgramImporter(BaseFXGraphImporter):
     def _select(self, node: fx.Node) -> relax.Var:
         x = self.env[node.args[0]]
         dim = node.args[1]
-        index = relax.const(node.args[2], "int64")
-        return self.block_builder.emit(relax.op.take(x, index, dim))
+        index_value = node.args[2]
+        index = relax.const(index_value, "int32")
+        mode = "wrap" if index_value < 0 else "fast"
+        return self.block_builder.emit(relax.op.take(x, index, dim, mode=mode))
 
     def _slice(self, node: fx.Node) -> relax.Var:
         import sys
@@ -1186,7 +1235,13 @@ class ExportedProgramImporter(BaseFXGraphImporter):
         dim = node.args[1]
         sizes = node.args[2]
 
-        x_shape = list(self.shape_of(x))
+        input_shape = self.shape_of(x)
+        if input_shape is None:
+            output_shape = self._shape_from_meta(node)
+            if output_shape is None:
+                raise ValueError("Cannot infer the output shape of unflatten")
+            return self.block_builder.emit(relax.op.reshape(x, output_shape))
+        x_shape = list(input_shape)
         if dim < 0:
             dim += len(x_shape)
 
@@ -1810,6 +1865,7 @@ class ExportedProgramImporter(BaseFXGraphImporter):
             "div.Tensor_mode": self._div,
             "eq.Scalar": self._binary_op(relax.op.equal, operator.eq),
             "eq.Tensor": self._binary_op(relax.op.equal, operator.eq),
+            "floordiv": self._binary_op(relax.op.floor_divide, operator.floordiv),
             "floor_divide.default": self._binary_op(relax.op.floor_divide, operator.floordiv),
             "fmod.Scalar": self._fmod,
             "fmod.Tensor": self._fmod,
@@ -1896,6 +1952,7 @@ class ExportedProgramImporter(BaseFXGraphImporter):
             "native_group_norm.default": self._native_group_norm,
             "layer_norm.default": self._layer_norm,
             "native_layer_norm.default": self._native_layer_norm,
+            "rms_norm.default": self._rms_norm,
             "linear.default": self._linear,
             "lstm.input": self._lstm,
             "gru.input": self._gru,
@@ -1910,6 +1967,9 @@ class ExportedProgramImporter(BaseFXGraphImporter):
             "upsample_bilinear2d.vec": self._upsample_bilinear2d,
             "_upsample_bilinear2d_aa.default": self._upsample_bilinear2d_aa,
             "upsample_nearest2d.vec": self._upsample_nearest2d,
+            "_upsample_nearest_exact2d.vec": self._upsample_nearest_exact2d,
+            "upsample_nearest3d.vec": self._upsample_nearest3d,
+            "_upsample_nearest_exact3d.vec": self._upsample_nearest_exact3d,
             "upsample_bicubic2d.vec": self._upsample_bicubic2d,
             # statistical
             "any.dim": self._any,
@@ -1928,6 +1988,7 @@ class ExportedProgramImporter(BaseFXGraphImporter):
             "argmax.default": self._argmax_argmin(relax.op.argmax),
             "argmin.default": self._argmax_argmin(relax.op.argmin),
             "where.self": self._where,
+            "where.Scalar": self._where,
             "bucketize.Tensor": self._bucketize,
             # tensor manipulation
             "argsort.default": self._argsort,
@@ -2090,35 +2151,68 @@ class ExportedProgramImporter(BaseFXGraphImporter):
 
         return str(symbol), tir_expr
 
+    def _shape_from_meta(self, node):
+        value = node.meta.get("val")
+        if not isinstance(value, torch.Tensor):
+            return super()._shape_from_meta(node)
+        shape = []
+        for dim in value.shape:
+            if isinstance(dim, torch.SymInt):
+                symbol = dim.node.expr if hasattr(dim.node, "expr") else dim.node
+                shape.append(self._convert_symbolic_shape_expr(symbol))
+            else:
+                shape.append(int(dim))
+        return shape
+
+    def _convert_symbolic_shape_expr(self, symbol):
+        import sympy
+
+        exact = self._torch_expr_to_relax_expr.get(str(symbol))
+        if exact is not None:
+            return exact
+        if isinstance(symbol, sympy.Symbol):
+            converted = self._torch_symbol_to_relax_expr.get(str(symbol))
+            if converted is None:
+                raise ValueError(f'Cannot bind symbolic shape variable "{symbol}" to an input axis')
+            return converted
+        if isinstance(symbol, sympy.Integer):
+            return tvm.tirx.IntImm("int64", int(symbol))
+        if isinstance(symbol, sympy.Add | sympy.Mul):
+            arguments = [self._convert_symbolic_shape_expr(arg) for arg in symbol.args]
+            converted = arguments[0]
+            for argument in arguments[1:]:
+                converted = (
+                    converted + argument if isinstance(symbol, sympy.Add) else converted * argument
+                )
+            return converted
+        raise ValueError(f'Unsupported symbolic shape expression "{symbol}"')
+
     def create_input_vars(
         self, exported_program: torch.export.ExportedProgram
     ) -> tuple[dict[str, relax.Var], dict[str, relax.Var], dict[str, tuple[int, int | None]]]:
         """Create relax input vars."""
+        import math
+
+        import sympy
+
         parameters_buffers_constants = OrderedDict()
         user_inputs = OrderedDict()
-        torch_symbol_to_relax_var: dict[str, tvm.tirx.Var] = {}
-        range_constraints = {}
+        torch_expr_to_relax_expr: dict[str, tvm.tirx.Expr] = {}
+        torch_symbol_to_relax_expr: dict[str, tvm.tirx.Expr] = {}
+        direct_relax_vars: dict[str, tvm.tirx.Var] = {}
+        derived_input_axes: list[tuple[object, tvm.tirx.Var]] = []
 
-        if hasattr(exported_program, "range_constraints"):
-            import math
-
-            for symbol, value_range in exported_program.range_constraints.items():
-                if hasattr(value_range, "lower") and hasattr(value_range, "upper"):
-                    try:
-                        # PyTorch uses int_oo (IntInfinity) for unbounded constraints
-                        lower = int(value_range.lower)
-                        upper = (
-                            None if math.isinf(float(value_range.upper)) else int(value_range.upper)
-                        )
-
-                        symbol_name, derived_expr = self._process_derived_symbol(
-                            symbol, torch_symbol_to_relax_var
-                        )
-                        if derived_expr is None:
-                            range_constraints[symbol_name] = (lower, upper)
-
-                    except (OverflowError, AttributeError, TypeError):
-                        continue
+        direct_input_symbols = set()
+        for node in exported_program.graph.nodes:
+            if node.op != "placeholder":
+                continue
+            tensor_meta = node.meta.get("tensor_meta", node.meta.get("val"))
+            for dim in getattr(tensor_meta, "shape", ()):
+                if not isinstance(dim, torch.SymInt):
+                    continue
+                symbol = dim.node.expr if hasattr(dim.node, "expr") else dim.node
+                if isinstance(symbol, sympy.Symbol):
+                    direct_input_symbols.add(str(symbol))
 
         named_buffers = OrderedDict(exported_program.named_buffers())
         for spec in exported_program.graph_signature.input_specs:
@@ -2150,16 +2244,28 @@ class ExportedProgramImporter(BaseFXGraphImporter):
             for s in torch_shape:
                 if isinstance(s, torch.SymInt):
                     sympy_node = s.node.expr if hasattr(s.node, "expr") else s.node
-                    symbol_name, derived_expr = self._process_derived_symbol(
-                        sympy_node, torch_symbol_to_relax_var
-                    )
-                    if derived_expr is not None:
-                        relax_shape.append(derived_expr)
-                    else:
-                        shape_var = torch_symbol_to_relax_var.setdefault(
-                            symbol_name, tvm.tirx.Var(symbol_name, "int64")
+                    expression_key = str(sympy_node)
+                    if isinstance(sympy_node, sympy.Symbol):
+                        shape_expr = direct_relax_vars.setdefault(
+                            expression_key,
+                            tvm.tirx.Var(expression_key, "int64"),
                         )
-                        relax_shape.append(shape_var)
+                        torch_symbol_to_relax_expr.setdefault(expression_key, shape_expr)
+                    elif all(
+                        str(symbol) in direct_input_symbols for symbol in sympy_node.free_symbols
+                    ):
+                        _, shape_expr = self._process_derived_symbol(
+                            sympy_node,
+                            direct_relax_vars,
+                        )
+                    else:
+                        symbol_name, _ = self._process_derived_symbol(sympy_node, {})
+                        shape_expr = torch_expr_to_relax_expr.get(expression_key)
+                        if shape_expr is None:
+                            shape_expr = tvm.tirx.Var(symbol_name, "int64")
+                            derived_input_axes.append((sympy_node, shape_expr))
+                    torch_expr_to_relax_expr.setdefault(expression_key, shape_expr)
+                    relax_shape.append(shape_expr)
                 else:
                     relax_shape.append(s)
             dtype = self._convert_data_type(torch_dtype)
@@ -2170,6 +2276,48 @@ class ExportedProgramImporter(BaseFXGraphImporter):
             else:
                 parameters_buffers_constants[name_hint] = relax_var
 
+        for derived_symbol, shape_var in derived_input_axes:
+            for base_symbol in derived_symbol.free_symbols:
+                base_name = str(base_symbol)
+                if base_name in torch_symbol_to_relax_expr:
+                    continue
+                coefficient = sympy.expand(derived_symbol).coeff(base_symbol)
+                remainder = sympy.simplify(derived_symbol - coefficient * base_symbol)
+                if not isinstance(coefficient, sympy.Integer) or not isinstance(
+                    remainder, sympy.Integer
+                ):
+                    continue
+                coefficient_value = int(coefficient)
+                if coefficient_value <= 0:
+                    continue
+                converted = shape_var - int(remainder)
+                if coefficient_value != 1:
+                    converted = tvm.tirx.floordiv(converted, coefficient_value)
+                torch_symbol_to_relax_expr[base_name] = converted
+
+        range_constraints = {}
+        if hasattr(exported_program, "range_constraints"):
+            for symbol, value_range in exported_program.range_constraints.items():
+                if not hasattr(value_range, "lower") or not hasattr(value_range, "upper"):
+                    continue
+                relax_expr = torch_expr_to_relax_expr.get(str(symbol))
+                if relax_expr is None:
+                    relax_expr = torch_symbol_to_relax_expr.get(str(symbol))
+                if relax_expr is None and isinstance(symbol, sympy.Symbol):
+                    relax_expr = tvm.tirx.Var(str(symbol), "int64")
+                    torch_expr_to_relax_expr[str(symbol)] = relax_expr
+                    torch_symbol_to_relax_expr[str(symbol)] = relax_expr
+                if not tvm.ir.is_prim_var(relax_expr):
+                    continue
+                try:
+                    lower = int(value_range.lower)
+                    upper = None if math.isinf(float(value_range.upper)) else int(value_range.upper)
+                except (OverflowError, AttributeError, TypeError):
+                    continue
+                range_constraints[relax_expr.name] = (lower, upper)
+
+        self._torch_expr_to_relax_expr = torch_expr_to_relax_expr
+        self._torch_symbol_to_relax_expr = torch_symbol_to_relax_expr
         return parameters_buffers_constants, user_inputs, range_constraints
 
     def from_exported_program(
@@ -2287,7 +2435,18 @@ class ExportedProgramImporter(BaseFXGraphImporter):
             binding[bind_name] = self._convert_pytorch_tensor_to_tvm(tensor_value)
 
         mod = self.block_builder.get()
-        mod = relax.transform.BindParams("main", binding)(mod)
+        main = mod["main"]
+        body_ty = main.body.body.ty if isinstance(main.body, relax.SeqExpr) else main.body.ty
+        mod["main"] = relax.Function(
+            main.params,
+            main.body,
+            body_ty,
+            main.is_pure,
+            main.attrs,
+            main.span,
+        )
+        if binding:
+            mod = relax.transform.BindParams("main", binding)(mod)
 
         if keep_params_as_input:
             parameters = dict(exported_program.named_parameters())

@@ -99,6 +99,8 @@ class CodeGenWebGPU final : public CodeGenC {
   bool enable_fp16_{false};
   // whether enable subgroups
   bool enable_subgroups_{false};
+  bool emit_nonfinite_f32_{false};
+  bool emit_nonfinite_f16_{false};
 
   /*! \brief Total bytes declared in the WGSL workgroup address space. */
   size_t workgroup_memory_bytes_{0};

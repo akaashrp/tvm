@@ -1179,5 +1179,33 @@ def test_no_reduction_loop_check():
     assert_structural_equal(mod, Before)
 
 
+def test_inner_spatial_reduction_with_three_output_axes_uses_fallback_rule():
+    @I.ir_module(s_tir=True)
+    class Before:
+        @T.prim_func(s_tir=True)
+        def main(
+            A: T.Buffer((1, 192, 2, 64, 112), "float32"),
+            B: T.Buffer((1, 1, 2, 64, 112), "float32"),
+        ):
+            T.func_attr({"tirx.noalias": True})
+            for n, c, t, h, w in T.grid(1, 192, 2, 64, 112):
+                with T.sblock("sum"):
+                    vn, vc, vt, vh, vw = T.axis.remap("SRSSS", [n, c, t, h, w])
+                    with T.init():
+                        B[vn, 0, vt, vh, vw] = T.float32(0)
+                    B[vn, 0, vt, vh, vw] = B[vn, 0, vt, vh, vw] + A[vn, vc, vt, vh, vw]
+
+    target = Target("webgpu")
+    assert dl.gpu.Reduction().apply(Before["main"], target, False) is None
+    with target:
+        mod = dl.ApplyDefaultSchedule(
+            dl.gpu.Reduction(),
+            dl.gpu.GeneralReduction(),
+            dl.gpu.Fallback(),
+        )(Before)
+
+    assert mod["main"].attrs["tirx.is_scheduled"] == 1
+
+
 if __name__ == "__main__":
     tvm.testing.main()

@@ -218,6 +218,23 @@ def test_binary_infer_ty_shape_symbolic(binary_arith_op: Callable):
     _check_inference(bb, binary_arith_op(x4, y4), relax.TensorType(dtype="float32", ndim=-1))
 
 
+def test_binary_infer_ty_reordered_symbolic_product():
+    bb = relax.BlockBuilder()
+    frames = tirx.Var("frames", "int64")
+    height = tirx.Var("height", "int64")
+    width = tirx.Var("width", "int64")
+    lhs_tokens = frames * tirx.floordiv(height, 2) * tirx.floordiv(width, 2)
+    rhs_tokens = frames * tirx.floordiv(width, 2) * tirx.floordiv(height, 2)
+    lhs = relax.Var("lhs", R.Tensor((1, lhs_tokens, 2, 6), "float32"))
+    rhs = relax.Var("rhs", R.Tensor((1, rhs_tokens, 1, 6), "float32"))
+
+    _check_inference(
+        bb,
+        relax.op.multiply(lhs, rhs),
+        relax.TensorType((1, lhs_tokens, 2, 6), "float32"),
+    )
+
+
 @pytest.mark.parametrize("binary_arith_op", [row[0] for row in binary_arith_ops])
 def test_binary_infer_ty_shape_var(binary_arith_op: Callable):
     bb = relax.BlockBuilder()

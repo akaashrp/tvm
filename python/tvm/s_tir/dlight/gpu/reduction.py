@@ -102,6 +102,14 @@ class Reduction(GPUScheduleRule):
         )
         if is_inner_reduction is None and c_factor is None:
             return None
+        if not is_inner_reduction:
+            material_spatial_axes = [
+                info for info in block_info.iters if info.kind == "S" and info.dom != 1
+            ]
+            # The rfactor write-back binding is not quasi-affine after reconstructing three or
+            # more spatial axes from one fused loop. GeneralReduction handles this layout.
+            if len(material_spatial_axes) >= 3:
+                return None
         # Step 3. Do the scheduling
         if is_inner_reduction:
             self._sch_inner_reduction(

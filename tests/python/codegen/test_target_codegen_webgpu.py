@@ -42,6 +42,33 @@ def test_codegen_buffer_access_modes():
     assert "var<storage, read_write> B_ptr" in source
 
 
+def test_codegen_nonfinite_float_literals():
+    @I.ir_module(s_tir=True)
+    class Module:
+        @T.prim_func(s_tir=True)
+        def main(
+            output_f32: T.Buffer((3,), "float32"),
+            output_f16: T.Buffer((3,), "float16"),
+        ):
+            for _ in T.thread_binding(1, thread="threadIdx.x"):
+                output_f32[0] = T.float32("inf")
+                output_f32[1] = T.float32("-inf")
+                output_f32[2] = T.float32("nan")
+                output_f16[0] = T.float16("inf")
+                output_f16[1] = T.float16("-inf")
+                output_f16[2] = T.float16("nan")
+
+    executable = tvm.compile(Module, target="webgpu")
+    source = executable.mod.imports[0].inspect_source("wgsl")
+
+    assert "tvm_webgpu_bitcast_f32(0x7f800000u)" in source
+    assert "tvm_webgpu_bitcast_f32(0xff800000u)" in source
+    assert "tvm_webgpu_bitcast_f32(0x7fc00000u)" in source
+    assert "tvm_webgpu_bitcast_f16(0x7c007c00u)" in source
+    assert "tvm_webgpu_bitcast_f16(0xfc00fc00u)" in source
+    assert "tvm_webgpu_bitcast_f16(0x7e007e00u)" in source
+
+
 def _build_webgpu(mod, target="webgpu"):
     build = tvm.get_global_func("target.build.webgpu")
     return build(mod, tvm.target.Target(target))
