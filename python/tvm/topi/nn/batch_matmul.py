@@ -91,7 +91,10 @@ def batch_matmul(
     else:
         YB, YK, YJ = get_const_tuple(tensor_b.shape)
 
-    assert XK == YK or tvm.ir.is_prim_var(YK), "shapes of x and y are inconsistent"
+    # Symbolic reductions can be equal without having identical expression
+    # trees (for example, 60 * n and 6 * (n * 10)).  A free variable on the
+    # right is not itself evidence that the reduction dimensions agree.
+    assert tvm.arith.Analyzer().can_prove_equal(XK, YK), "shapes of x and y are inconsistent"
     k = te.reduce_axis((0, XK), name="k")
     if oshape is None:
         assert XB == YB or XB == 1 or YB == 1, "batch dimension doesn't match"

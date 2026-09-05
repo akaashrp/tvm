@@ -914,10 +914,10 @@ export class WebGPUContext {
 
   // DeviceAPI
   private deviceAllocDataSpace(nbytes: number): GPUPointer {
-    // allocate 0 bytes buffer as 1 bytes buffer.
-    if (nbytes == 0) {
-      nbytes = 1;
-    }
+    // Storage bindings and padded host writes require a multiple of four
+    // bytes. Empty tensors can still occur as kernel arguments (for example
+    // an empty temporal tail), so keep their backing binding valid as well.
+    nbytes = Math.max(4, Math.ceil(nbytes / 4) * 4);
     const buffer = tryCreateBuffer(this.device, {
       size: nbytes,
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,

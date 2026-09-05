@@ -66,6 +66,26 @@ def test_fallback():
     assert_structural_equal(mod, After)
 
 
+def test_fallback_broadcast_with_affine_symbolic_extent():
+    @T.prim_func(s_tir=True)
+    def before(a: T.handle, bias: T.Buffer((192,), "float32"), c: T.handle):
+        frames = T.int64()
+        A = T.match_buffer(a, (192, 4 * frames - 3, 96, 160), "float32")
+        C = T.match_buffer(c, (192, 4 * frames - 3, 96, 160), "float32")
+        for channel, frame, row, col in T.grid(192, 4 * frames - 3, 96, 160):
+            with T.sblock("broadcast_add"):
+                vc, vf, vr, vw = T.axis.remap("SSSS", [channel, frame, row, col])
+                C[vc, vf, vr, vw] = A[vc, vf, vr, vw] + bias[vc]
+
+    with Target("webgpu"):
+        scheduled = dl.ApplyDefaultSchedule(dl.gpu.Fallback())(tvm.IRModule({"main": before}))
+    assert scheduled["main"].attrs["tirx.is_scheduled"]
+    script = scheduled.script()
+    assert "frames" in script
+    assert 'thread="blockIdx.x"' in script
+    assert 'thread="threadIdx.x"' in script
+
+
 def test_fallback_reduction():
     @I.ir_module(s_tir=True)
     class Module:

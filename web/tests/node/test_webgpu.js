@@ -124,6 +124,20 @@ function createContext(deviceOptions) {
   };
 }
 
+test.each([[0, 4], [1, 4], [2, 4], [3, 4], [4, 4], [5, 8], [16, 16]])(
+  "storage allocation of %i bytes has a valid %i-byte binding",
+  (requested, expected) => {
+    const { device, context } = createContext();
+    const allocate = context.getDeviceAPI("deviceAllocDataSpace");
+    const free = context.getDeviceAPI("deviceFreeDataSpace");
+    const pointer = allocate(requested);
+    expect(device.createBuffer.mock.lastCall[0].size).toBe(expected);
+    const buffer = device.createBuffer.mock.results.at(-1).value;
+    free(pointer);
+    expect(buffer.destroy).toHaveBeenCalledTimes(1);
+  }
+);
+
 test("compute dispatches and GPU copies share one submission", async () => {
   const { context, device, queue, encoders, source, destination } = createContext();
   const copyWithinGPU = context.getDeviceAPI("deviceCopyWithinGPU");

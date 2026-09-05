@@ -120,6 +120,13 @@ class TVM_RUNTIME_DLL Allocator {
   /*! \brief Check if the given memory scope is allowed to allocate by the allocator. */
   virtual bool AllowMemoryScope(const std::string& mem_scope) const;
 
+ public:
+  /*! \brief Limit cached free bytes without releasing live allocations.
+   *  \param max_cached_bytes The free-cache ceiling; SIZE_MAX means unlimited.
+   *  Allocators without a configurable free cache reject this operation.
+   */
+  virtual void SetMaxCachedBytes(size_t max_cached_bytes);
+
  private:
   AllocatorType type_;
 };
@@ -143,6 +150,11 @@ class MemoryManager {
   TVM_RUNTIME_DLL static Allocator* GetAllocator(Device dev, AllocatorType type);
   /*! \brief Clear the allocators. */
   static void Clear();
+  /*! \brief Set a device's pooled free-cache ceiling, trimming it immediately.
+   *  \param dev The device whose pooled allocator is configured.
+   *  \param max_cached_bytes Free bytes to retain; SIZE_MAX means unlimited.
+   */
+  TVM_RUNTIME_DLL static void SetPoolMaxCachedBytes(Device dev, size_t max_cached_bytes);
 
  private:
   MemoryManager() {}

@@ -28,9 +28,10 @@
 #include <tvm/runtime/memory/memory_manager.h>
 
 #include <atomic>
+#include <limits>
+#include <map>
 #include <mutex>
 #include <string>
-#include <unordered_map>
 #include <vector>
 
 namespace tvm {
@@ -54,6 +55,8 @@ class PooledAllocator : public Allocator {
       auto&& pool = it->second;
       auto ret = pool.back();
       pool.pop_back();
+      cached_memory_ -= ret.size;
+      if (pool.empty()) memory_pool_.erase(it);
       return ret;
     }
     Buffer buf;
@@ -85,16 +88,26 @@ class PooledAllocator : public Allocator {
 
   void Free(const Buffer& buffer) override {
     std::lock_guard<std::recursive_mutex> lock(mu_);
-    if (memory_pool_.find(buffer.size) == memory_pool_.end()) {
-      memory_pool_.emplace(buffer.size, std::vector<Buffer>{});
+    if (max_cached_bytes_ == 0 || buffer.size > max_cached_bytes_) {
+      DeviceFreeDataSpace(buffer.device, buffer.data);
+      used_memory_.fetch_sub(buffer.size, std::memory_order_relaxed);
+      return;
     }
-    memory_pool_.at(buffer.size).push_back(buffer);
+    memory_pool_[buffer.size].push_back(buffer);
+    cached_memory_ += buffer.size;
+    TrimCachedMemory();
     VLOG(1) << "reclaim buffer " << buffer.size;
   }
 
   void Clear() override { ReleaseAll(); }
 
   size_t UsedMemory() const override { return used_memory_.load(std::memory_order_relaxed); }
+
+  void SetMaxCachedBytes(size_t max_cached_bytes) override {
+    std::lock_guard<std::recursive_mutex> lock(mu_);
+    max_cached_bytes_ = max_cached_bytes;
+    TrimCachedMemory();
+  }
 
  protected:
   virtual void* DeviceAllocDataSpace(Device dev, size_t nbytes, size_t alignment,
@@ -108,21 +121,38 @@ class PooledAllocator : public Allocator {
 
   virtual void ReleaseAll() {
     std::lock_guard<std::recursive_mutex> lock(mu_);
-    for (auto const& it : memory_pool_) {
-      auto const& pool = it.second;
-      for (auto const& buf : pool) {
-        DeviceFreeDataSpace(buf.device, buf.data);
-      }
+    while (!memory_pool_.empty()) {
+      ReleaseLargestCachedBuffer();
     }
-    memory_pool_.clear();
-    used_memory_ = 0;
     VLOG(1) << "release all buffers";
+  }
+
+  // Caller holds mu_.  Evict only cached buffers, largest size first, while
+  // keeping total device allocation accounting inclusive of live buffers.
+  void ReleaseLargestCachedBuffer() {
+    auto it = memory_pool_.end();
+    --it;
+    const auto& buffer = it->second.back();
+    DeviceFreeDataSpace(buffer.device, buffer.data);
+    cached_memory_ -= buffer.size;
+    used_memory_.fetch_sub(buffer.size, std::memory_order_relaxed);
+    it->second.pop_back();
+    if (it->second.empty()) memory_pool_.erase(it);
+  }
+
+  void TrimCachedMemory() {
+    while (!memory_pool_.empty() &&
+           (cached_memory_ > max_cached_bytes_ || max_cached_bytes_ == 0)) {
+      ReleaseLargestCachedBuffer();
+    }
   }
 
  protected:
   size_t page_size_;
   std::atomic<size_t> used_memory_;
-  std::unordered_map<size_t, std::vector<Buffer>> memory_pool_;
+  size_t cached_memory_{0};
+  size_t max_cached_bytes_{std::numeric_limits<size_t>::max()};
+  std::map<size_t, std::vector<Buffer>> memory_pool_;
   std::recursive_mutex mu_;
 };
 

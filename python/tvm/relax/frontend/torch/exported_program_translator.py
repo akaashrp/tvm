@@ -1227,13 +1227,43 @@ class ExportedProgramImporter(BaseFXGraphImporter):
         begin = [start]
         end = [end_val]
         stride = [step]
-        return self.block_builder.emit(relax.op.strided_slice(x, axes, begin, end, stride))
+        assume_inbound = False
+        in_shape = self.shape_of(x)
+        if in_shape is not None and isinstance(step, int) and step > 0:
+            extent = in_shape[dim]
+            if not isinstance(extent, tvm.tirx.IntImm):
+                analyzer = tvm.arith.Analyzer()
+                for var in tvm.tirx.analysis.undefined_vars(extent):
+                    bounds = getattr(self, "_input_range_constraints", {}).get(var.name)
+                    if bounds is not None:
+                        lower, upper = bounds
+                        analyzer.update(
+                            var,
+                            tvm.arith.ConstIntBound(
+                                lower,
+                                (upper if upper is not None else tvm.arith.ConstIntBound.POS_INF),
+                            ),
+                        )
+                # An omitted end denotes the input extent.  When the export
+                # bounds prove the slice stays inside that extent, avoid
+                # introducing min(INT64_MAX, extent) and min(start, extent)
+                # into downstream residual/broadcast shapes.
+                if isinstance(end_val, int) and end_val >= sys.maxsize:
+                    end = [extent]
+                assume_inbound = (
+                    analyzer.can_prove(start >= 0)
+                    and analyzer.can_prove(start <= end[0])
+                    and analyzer.can_prove(end[0] <= extent)
+                )
+        return self.block_builder.emit(
+            relax.op.strided_slice(x, axes, begin, end, stride, assume_inbound=assume_inbound)
+        )
 
     def _unflatten(self, node: fx.Node) -> relax.Var:
         args = self.retrieve_args(node)
         x = args[0]
-        dim = node.args[1]
-        sizes = node.args[2]
+        dim = args[1]
+        sizes = list(args[2])
 
         input_shape = self.shape_of(x)
         if input_shape is None:
@@ -2343,6 +2373,7 @@ class ExportedProgramImporter(BaseFXGraphImporter):
             user_input_vars,
             range_constraints,
         ) = self.create_input_vars(exported_program)
+        self._input_range_constraints = range_constraints
         inputs_vars = user_input_vars.copy()
         inputs_vars.update(parameter_buffer_constant_vars)
 

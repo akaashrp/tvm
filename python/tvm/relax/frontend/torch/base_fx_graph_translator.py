@@ -2039,6 +2039,10 @@ class BaseFXGraphImporter(metaclass=abc.ABCMeta):
         # args[1] is the 'other' tensor
         data = args[0]
         other_shape = self.shape_of(args[1])  # the shape of 'other'
+        if other_shape is None:
+            other_shape = self._shape_from_meta(node)
+        if other_shape is None:
+            raise ValueError("Cannot infer the output shape of expand_as")
         return self.block_builder.emit(relax.op.broadcast_to(data, other_shape))
 
     def _flatten_impl(self, x, start_dim, end_dim) -> relax.Var:

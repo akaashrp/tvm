@@ -16,6 +16,7 @@
 # under the License.
 """Dispatch large dense attention calls to an online-softmax GPU kernel."""
 
+from collections.abc import Mapping
 from typing import NamedTuple
 
 from tvm import DataType, arith, relax, tirx
@@ -69,7 +70,12 @@ def _can_prove_equal(analyzer: arith.Analyzer, lhs: Expr, rhs: Expr) -> bool:
     return True
 
 
-def get_attention_dispatch_info(call: relax.Call) -> AttentionDispatchInfo | None:
+def get_attention_dispatch_info(
+    call: relax.Call,
+    *,
+    upper_bounds: Mapping[str, int] | None = None,
+    lower_bounds: Mapping[str, int] | None = None,
+) -> AttentionDispatchInfo | None:
     """Keep buffer accounting and dispatch eligibility on the same predicate."""
 
     if not isinstance(call.op, Op) or call.op.name != "relax.nn.attention":
@@ -118,13 +124,31 @@ def get_attention_dispatch_info(call: relax.Call) -> AttentionDispatchInfo | Non
         return None
 
     scale = float(call.attrs.scale) if call.attrs.scale is not None else head_dim**-0.5
+
+    def dimension_upper_bound(dim):
+        if isinstance(dim, tirx.IntImm):
+            return int(dim)
+        bound_analyzer = arith.Analyzer()
+        for var in tirx.analysis.undefined_vars(dim):
+            if upper_bounds is None or var.name not in upper_bounds:
+                return None
+            lower = int((lower_bounds or {}).get(var.name, 0))
+            upper = int(upper_bounds[var.name])
+            if lower > upper:
+                return None
+            bound_analyzer.update(var, arith.ConstIntBound(lower, upper))
+        bound = bound_analyzer.const_int_bound(dim)
+        return int(bound.max_value) if 0 < bound.max_value < arith.ConstIntBound.POS_INF else None
+
+    dimensions = [dimension_upper_bound(dim) for dim in (batch, query_length, key_length)]
     score_buffer_bytes = None
-    if all(isinstance(dim, tirx.IntImm) for dim in (batch, query_length, key_length)):
+    if all(dim is not None for dim in dimensions):
+        bounded_batch, bounded_query, bounded_key = dimensions
         score_buffer_bytes = (
-            int(batch)
+            bounded_batch
             * query_heads
-            * int(query_length)
-            * int(key_length)
+            * bounded_query
+            * bounded_key
             * ((DataType(dtype).bits + 7) // 8)
         )
     return AttentionDispatchInfo(
@@ -145,6 +169,8 @@ class AttentionDispatcher(BackendDispatcher):
         super().__init__(mod)
         self.max_score_buffer_bytes = max_score_buffer_bytes
         self.kernels = {}
+        self.upper_bounds = {}
+        self.lower_bounds = {}
 
     def visit_call_(self, call: relax.Call) -> relax.Expr:
         if not isinstance(call.op, Op) or call.op.name != "relax.nn.attention":
@@ -152,7 +178,9 @@ class AttentionDispatcher(BackendDispatcher):
         target = self._get_target(call.ty)
         if target.kind.name != "webgpu":
             return super().visit_call_(call)
-        info = get_attention_dispatch_info(call)
+        info = get_attention_dispatch_info(
+            call, upper_bounds=self.upper_bounds, lower_bounds=self.lower_bounds
+        )
         if info is None:
             return super().visit_call_(call)
         if (
@@ -212,6 +240,15 @@ def DispatchAttention(max_score_buffer_bytes: int = 128 * 1024 * 1024):
         dispatcher = AttentionDispatcher(mod, max_score_buffer_bytes)
         for global_var, function in mod.functions_items():
             if isinstance(function, relax.Function):
+                attrs = function.attrs or {}
+                dispatcher.upper_bounds = {
+                    str(name): int(value)
+                    for name, value in attrs.get("tir_var_upper_bound", {}).items()
+                }
+                dispatcher.lower_bounds = {
+                    str(name): int(value)
+                    for name, value in attrs.get("tir_var_lower_bound", {}).items()
+                }
                 function = dispatcher.visit_expr(function)
                 dispatcher.builder_.update_func(global_var, function)
         return dispatcher.builder_.finalize()

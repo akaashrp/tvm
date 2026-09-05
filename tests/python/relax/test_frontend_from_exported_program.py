@@ -5745,6 +5745,42 @@ def test_slice_with_symbolic_end():
     verify_model(SliceStaticModel(), example_args_static, {}, ExpectedStatic)
 
 
+def test_bounded_symbolic_tail_slice_preserves_residual_shape():
+    class TailResidual(torch.nn.Module):
+        def forward(self, x, residual, shape_reference):
+            return (x[:, :, 1:] + residual).abs()
+
+    frames = torch.export.Dim("frames", min=1, max=9)
+    model = TailResidual()
+    exported_program = export(
+        model,
+        # The enclosing decoder exposes the base temporal dimension directly.
+        # Keep that binding here; derived-only input dimensions are a separate
+        # importer constraint and should not obscure the tail-slice regression.
+        args=(torch.randn(1, 4, 10), torch.randn(1, 4, 9), torch.randn(1, 5)),
+        dynamic_shapes=({2: 2 * frames}, {2: 2 * frames - 1}, {1: frames}),
+    )
+    mod = from_exported_program(exported_program, run_ep_decomposition=False)
+    assert "assume_inbound=True" in mod.script()
+    mod = tvm.transform.Sequential([relax.transform.LegalizeOps(), relax.transform.FoldConstant()])(
+        mod
+    )
+    executable = relax.build(mod, tvm.target.Target("llvm"))
+    vm = relax.VirtualMachine(executable, tvm.cpu())
+    for frame_count in (1, 2, 5, 9):
+        x = torch.randn(1, 4, 2 * frame_count)
+        residual = torch.randn(1, 4, 2 * frame_count - 1)
+        shape_reference = torch.randn(1, frame_count)
+        actual = vm["main"](
+            tvm.runtime.tensor(x.numpy()),
+            tvm.runtime.tensor(residual.numpy()),
+            tvm.runtime.tensor(shape_reference.numpy()),
+        )
+        np.testing.assert_array_equal(
+            actual[0].numpy(), model(x, residual, shape_reference).numpy()
+        )
+
+
 def test_derived_input_dimension_without_exported_program_decomposition():
     class IdentityPair(torch.nn.Module):
         def forward(self, x, y):
@@ -5765,6 +5801,33 @@ def test_derived_input_dimension_without_exported_program_decomposition():
     x_shape = mod["main"].params[0].ty.shape.values
     y_shape = mod["main"].params[1].ty.shape.values
     assert tvm.arith.Analyzer().can_prove_equal(y_shape[1], x_shape[1] * 2)
+
+
+@pytest.mark.parametrize("dim", [1, -2])
+def test_symbolic_unflatten_without_exported_program_decomposition(dim):
+    class Unflatten(torch.nn.Module):
+        def forward(self, x, shape_ref):
+            return x.unflatten(dim, (shape_ref.shape[1], 6))
+
+    frames = torch.export.Dim("frames", min=1, max=9)
+    model = Unflatten()
+    exported_program = export(
+        model,
+        args=(torch.randn(1, 18, 4), torch.randn(1, 3)),
+        dynamic_shapes=({1: 6 * frames}, {1: frames}),
+    )
+    mod = from_exported_program(exported_program, run_ep_decomposition=False)
+    input_shape = mod["main"].params[1].ty.shape.values
+    output_shape = mod["main"].ret_ty.fields[0].shape.values
+    assert tvm.arith.Analyzer().can_prove_equal(output_shape[1], input_shape[1])
+
+    executable = relax.build(mod, tvm.target.Target("llvm"))
+    vm = relax.VirtualMachine(executable, tvm.cpu())
+    for frame_count in (1, 2, 5, 9):
+        x = torch.randn(1, 6 * frame_count, 4)
+        shape_ref = torch.randn(1, frame_count)
+        actual = vm["main"](tvm.runtime.tensor(x.numpy()), tvm.runtime.tensor(shape_ref.numpy()))
+        np.testing.assert_array_equal(actual[0].numpy(), model(x, shape_ref).numpy())
 
 
 def test_dynamic_patch_flatten_without_exported_program_decomposition():
@@ -5835,6 +5898,27 @@ def test_expand_with_new_leading_dimension():
     assert tvm.arith.Analyzer().can_prove_equal(output_shape[0], 2)
     assert tvm.arith.Analyzer().can_prove_equal(output_shape[1], input_shape[0])
     assert tvm.arith.Analyzer().can_prove_equal(output_shape[2], input_shape[1])
+
+
+def test_expand_as_symbolic_slice():
+    class ExpandSlice(torch.nn.Module):
+        def forward(self, x):
+            return torch.ones(1, 1, 1).expand_as(x[:, :, 1:])
+
+    frames = torch.export.Dim("frames", min=3, max=9)
+    model = ExpandSlice()
+    exported_program = export(
+        model,
+        args=(torch.randn(1, 3, 5),),
+        dynamic_shapes={"x": {2: frames}},
+    )
+    mod = from_exported_program(exported_program, run_ep_decomposition=False)
+    executable = relax.build(mod, tvm.target.Target("llvm"))
+    vm = relax.VirtualMachine(executable, tvm.cpu())
+    for frame_count in (3, 5, 9):
+        x = torch.randn(1, 3, frame_count)
+        actual = vm["main"](tvm.runtime.tensor(x.numpy()))
+        np.testing.assert_array_equal(actual[0].numpy(), model(x).numpy())
 
 
 def test_dynamic_scalar_item_in_shape_operations():

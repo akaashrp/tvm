@@ -146,6 +146,41 @@ def test_dispatches_attention_with_symbolic_sequence_lengths():
     assert "relax.call_tir" in _relax_ops(after)
 
 
+@pytest.mark.parametrize("limit,materialized", [(6144, True), (6143, False)])
+def test_attention_dispatch_uses_symbolic_bounds(limit, materialized):
+    function = DynamicAttentionModule["main"].with_attr(
+        "tir_var_upper_bound", {"query_length": 8, "key_length": 16}
+    )
+    # 1 batch * 12 heads * 8 queries * 16 keys * 4 bytes = 6144 bytes.
+    with _webgpu_target():
+        after = relax.backend.DispatchAttention(limit)(tvm.IRModule({"main": function}))
+    assert ("relax.nn.attention" in _relax_ops(after)) == materialized
+
+
+def test_small_bounded_batch_attention_with_wide_heads_stays_materialized():
+    @I.ir_module
+    class Module:
+        @R.function
+        def main(
+            q: R.Tensor(("batch", 240, 1, 1024), "float32"),
+            k: R.Tensor(("batch", 240, 1, 1024), "float32"),
+            v: R.Tensor(("batch", 240, 1, 1024), "float32"),
+        ) -> R.Tensor(("batch", 240, 1, 1024), "float32"):
+            R.func_attr({"tir_var_lower_bound": {"batch": 1}, "tir_var_upper_bound": {"batch": 9}})
+            return R.nn.attention(q, k, v)
+
+    with _webgpu_target(32768):
+        after = relax.backend.DispatchAttention(9 * 240 * 240 * 4)(Module)
+    assert "relax.nn.attention" in _relax_ops(after)
+
+
+def test_partial_symbolic_bounds_keep_online_attention():
+    function = DynamicAttentionModule["main"].with_attr("tir_var_upper_bound", {"query_length": 8})
+    with _webgpu_target():
+        after = relax.backend.DispatchAttention()(tvm.IRModule({"main": function}))
+    assert "relax.nn.attention" not in _relax_ops(after)
+
+
 def test_float16_attention_auxiliary_output_matches_kernel_signature():
     with _webgpu_target():
         after = relax.backend.DispatchAttention(0)(Float16AttentionModule)

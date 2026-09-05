@@ -2147,6 +2147,15 @@ bool IterMapRewriter::CanProveDivisible(const PrimExpr& lhs, const PrimExpr& rhs
   PrimExpr dividend = normalizer.Convert(lhs);
   PrimExpr divisor = normalizer.Convert(rhs);
 
+  // Symbolic extents can contain a negative offset.  The floor-mod
+  // simplifier may not know their sign, but a product is still divisible
+  // by either factor wherever the original division is defined.
+  if (const auto* product = dividend.as<MulNode>()) {
+    if (CanProveDivisible(product->a, divisor) || CanProveDivisible(product->b, divisor)) {
+      return true;
+    }
+  }
+
   return analyzer_->CanProveEqual(dividend, divisor) ||
          analyzer_->CanProve(floormod(dividend, divisor) == 0);
 }

@@ -27,6 +27,7 @@
 #include <tvm/runtime/logging.h>
 #include <tvm/runtime/memory/memory_manager.h>
 
+#include <limits>
 #include <memory>
 #include <utility>
 
@@ -216,6 +217,10 @@ void MemoryManager::Clear() {
   }
 }
 
+void MemoryManager::SetPoolMaxCachedBytes(Device dev, size_t max_cached_bytes) {
+  GetOrCreateAllocator(dev, kPooled)->SetMaxCachedBytes(max_cached_bytes);
+}
+
 Tensor Allocator::Empty(ffi::Shape shape, DLDataType dtype, DLDevice dev,
                         ffi::Optional<ffi::String> mem_scope) {
   VerifyDataType(dtype);
@@ -268,9 +273,29 @@ void Allocator::Clear() {
   // Pooled allocator will override this method.
 }
 
+void Allocator::SetMaxCachedBytes(size_t max_cached_bytes) {
+  TVM_FFI_THROW(ValueError) << "This allocator does not support a free-cache byte limit";
+}
+
 TVM_FFI_STATIC_INIT_BLOCK() {
   namespace refl = tvm::ffi::reflection;
   refl::GlobalDef().def("vm.builtin.memory_manager.clear", MemoryManager::Clear);
+  refl::GlobalDef().def(
+      "vm.builtin.memory_manager.set_pool_max_cached_bytes",
+      [](int device_type, int device_id, int64_t max_bytes) {
+        if (device_type <= 0 || device_id < 0 || max_bytes < -1) {
+          TVM_FFI_THROW(ValueError)
+              << "Expected a valid device and nonnegative pool cache bytes (-1 for unlimited)";
+        }
+        if (max_bytes >= 0 &&
+            static_cast<uint64_t>(max_bytes) > std::numeric_limits<size_t>::max()) {
+          TVM_FFI_THROW(ValueError) << "Pool cache byte limit exceeds the runtime address space";
+        }
+        size_t limit =
+            max_bytes == -1 ? std::numeric_limits<size_t>::max() : static_cast<size_t>(max_bytes);
+        Device dev{static_cast<DLDeviceType>(device_type), device_id};
+        MemoryManager::SetPoolMaxCachedBytes(dev, limit);
+      });
 }
 
 }  // namespace memory
