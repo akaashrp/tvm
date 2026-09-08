@@ -1029,6 +1029,8 @@ export type InitProgressCallback = (report: InitProgressReport) => void;
 
 export interface FetchTensorCacheOptions extends TensorCacheAccessOptions {
   signal?: AbortSignal;
+  /** Download each shard when consumed instead of eagerly filling the cache. */
+  prefetchCache?: boolean;
 }
 
 /**
@@ -1049,6 +1051,8 @@ export interface FetchTensorCacheOptions extends TensorCacheAccessOptions {
  * - {@link detachFromCurrentScope}
  */
 export class Instance implements Disposable {
+  /** Allows clients to select bounded streaming without relying on version strings. */
+  readonly supportsTensorCacheStreaming = true;
   memory: Memory;
   exports: Record<string, Function>;
   cacheMetadata: Record<string, any> = {};
@@ -1523,7 +1527,7 @@ export class Instance implements Disposable {
     await this.fetchTensorCacheInternal(
       tensorCacheUrl,
       list["records"] as Array<TensorShardEntry>, device, artifactCache,
-      effectiveSignal);
+      effectiveSignal, options.prefetchCache ?? true);
     this.cacheMetadata = { ...this.cacheMetadata, ...(list["metadata"] as Record<string, any>) };
   }
 
@@ -1601,6 +1605,7 @@ export class Instance implements Disposable {
     device: DLDevice,
     artifactCache: ArtifactCacheTemplate,
     signal?: AbortSignal,
+    prefetchCache = true,
   ) {
     const perf = compact.getPerformance();
     const tstart = perf.now();
@@ -1620,7 +1625,8 @@ export class Instance implements Disposable {
       for (let j = 0; j < this.initProgressCallback.length; ++j) {
         let text: string;
         if (loading) {
-          text = "Loading model from cache[" + iter + "/" + list.length + "]: ";
+          text = (prefetchCache || cacheOnly ? "Loading model from cache[" : "Loading model shards[")
+            + iter + "/" + list.length + "]: ";
           text += Math.ceil(fetchedBytes / (1024 * 1024)).toString() + "MB loaded. "
           text += Math.floor(fetchedBytes * 100 / totalBytes).toString() + "% completed, "
           text += timeElapsed + " secs elapsed.";
@@ -1666,7 +1672,7 @@ export class Instance implements Disposable {
       }
     }
     // We launch 4 parallel for loops to limit the max concurrency to 4 download
-    if (!cacheOnly) {
+    if (!cacheOnly && prefetchCache) {
       const loopSize = Math.floor(list.length / 4);
       await Promise.all([
         downloadCache(0, loopSize),
@@ -1682,11 +1688,13 @@ export class Instance implements Disposable {
 
     // Then iteratively, load the shard from cache
     for (let i = 0; i < list.length; ++i) {
+      signal?.throwIfAborted();
       const shard = list[i];
       const dataUrl = new URL(shard.dataPath, tensorCacheUrl).href;
       let buffer;
       try {
-        buffer = await artifactCache.fetchWithCache(dataUrl, "arraybuffer");
+        buffer = await artifactCache.fetchWithCache(dataUrl, "arraybuffer", signal);
+        signal?.throwIfAborted();
       } catch (err) {
         this.env.logger("Error: Cannot fetch " + dataUrl + " err= " + err);
         throw err;
@@ -1695,6 +1703,7 @@ export class Instance implements Disposable {
         buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
       const shardRecords = shard.records;
       for (let j = 0; j < shardRecords.length; ++j) {
+        signal?.throwIfAborted();
         let cpu_arr: Tensor | undefined;
         let gpu_arr: Tensor | undefined;
         try {

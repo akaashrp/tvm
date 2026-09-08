@@ -257,6 +257,46 @@ test("direct upload snapshots a borrowed shard view before synchronization", asy
   }
 });
 
+test("streaming uploads each shard before fetching the next and forwards cancellation", async () => {
+  const tvm = createInstance();
+  const gpu = createMockGPUDevice();
+  tvm.initWebGPU(gpu.device);
+  const controller = new AbortController();
+  const order = [];
+  const manifest = { metadata: {}, records: [0, 1, 2].map((index) => ({
+    dataPath: `${index}.bin`, format: "raw-shard", nbytes: 4,
+    records: [{name: `stream.${index}`, shape: [1], dtype: "uint32",
+      format: "raw", byteOffset: 0, nbytes: 4}],
+  })) };
+  const cache = {
+    hasAllKeys: async () => false,
+    addToCache: jest.fn(() => { throw new Error("Streaming must not prefetch all shards"); }),
+    fetchWithCache: async (url, type, signal) => {
+      expect(signal).toBe(controller.signal);
+      if (type === "json") return manifest;
+      const index = Number(new URL(url).pathname.split("/").pop().split(".")[0]);
+      order.push(index);
+      expect(gpu.writes).toHaveLength(index);
+      if (index === 1) controller.abort();
+      return new Uint32Array([index]).buffer;
+    },
+  };
+  const log = jest.spyOn(console, "log").mockImplementation(() => {});
+  try {
+    expect(tvm.supportsTensorCacheStreaming).toBe(true);
+    await expect(tvm.fetchTensorCache("https://example.test/model/", tvm.webgpu(), {
+      artifactCache: cache, prefetchCache: false, signal: controller.signal,
+    })).rejects.toMatchObject({name: "AbortError"});
+    expect(order).toEqual([0, 1]);
+    expect(gpu.writes).toHaveLength(1);
+    expect(cache.addToCache).not.toHaveBeenCalled();
+  } finally {
+    log.mockRestore();
+    tvm.tensorCacheClear();
+    tvm.dispose();
+  }
+});
+
 test("direct tensor-cache upload rejects a record with the wrong size", async () => {
   const log = jest.spyOn(console, "log").mockImplementation(() => {});
   const tvm = createInstance();
