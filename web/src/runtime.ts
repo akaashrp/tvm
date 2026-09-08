@@ -722,18 +722,33 @@ export class Tensor extends TVMObject {
    * Create a view of the array.
    * @param shape The shape of the view.
    * @param dtype The data type of the new array.
+   * @param relativeByteOffset Byte offset relative to this tensor's storage.
    * @returns The new sliced ndarray.
    */
-  view(shape: Array<number>, dtype?: string): Tensor {
+  view(shape: Array<number>, dtype?: string, relativeByteOffset = 0): Tensor {
+    if (shape.some(dim => !Number.isSafeInteger(dim) || dim < 0)) {
+      throw new Error("Tensor view shape must contain nonnegative safe integers");
+    }
+    if (!Number.isSafeInteger(relativeByteOffset) || relativeByteOffset < 0 ||
+        relativeByteOffset > this.numStorageBytes()) {
+      throw new Error("Tensor view byte offset is outside the source storage");
+    }
     const shapeArray = shape.map((value) => new Scalar(value, "int"));
     if (dtype === undefined) {
       dtype = this.dtype;
     }
+    if (dtype === this.dtype) {
+      const bytes = Math.ceil(shape.reduce((count, dim) => count * dim,
+        this.dlDataType.bits * this.dlDataType.lanes) / 8);
+      if (!Number.isSafeInteger(bytes) || bytes > this.numStorageBytes() - relativeByteOffset) {
+        throw new Error("Tensor view exceeds source storage");
+      }
+    }
     return this.ctx.tensorCreateView(
       this,
       this.ctx.makeShapeTuple(...shapeArray),
-      this.dtype,
-      /*relative_byte_offset=*/ new Scalar(0, "int"),
+      dtype,
+      new Scalar(relativeByteOffset, "int"),
     );
   }
   /**
@@ -1053,6 +1068,7 @@ export interface FetchTensorCacheOptions extends TensorCacheAccessOptions {
 export class Instance implements Disposable {
   /** Allows clients to select bounded streaming without relying on version strings. */
   readonly supportsTensorCacheStreaming = true;
+  readonly supportsTensorOffsetViews = true;
   memory: Memory;
   exports: Record<string, Function>;
   cacheMetadata: Record<string, any> = {};

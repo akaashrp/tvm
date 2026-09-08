@@ -55,6 +55,25 @@ test("array copy", () => {
   });
 });
 
+test("tensor views preserve nested byte offsets, dtype and shared writes", () => {
+  tvm.withNewScope(() => {
+    const source = tvm.empty([8], "float32").copyFrom([0, 1, 2, 3, 4, 5, 6, 7]);
+    const middle = source.view([4], "float32", 8);
+    const nested = middle.view([2], "float32", 4);
+    assert.deepStrictEqual(Array.from(nested.toArray()), [3, 4]);
+    nested.copyFrom([30, 40]);
+    assert.deepStrictEqual(Array.from(source.toArray()), [0, 1, 2, 30, 40, 5, 6, 7]);
+    const bytes = nested.view([8], "uint8");
+    assert.strictEqual(bytes.dtype, "uint8");
+    assert.deepStrictEqual(Array.from(bytes.toArray()), Array.from(new Uint8Array(Float32Array.from([30, 40]).buffer)));
+    for (const offset of [-1, .5, NaN, 33, Number.MAX_SAFE_INTEGER + 1]) {
+      assert.throws(() => source.view([1], "float32", offset), /byte offset/);
+    }
+    assert.throws(() => middle.view([3], "float32", 8), /exceeds source storage/);
+    assert.throws(() => source.view([-1]), /shape/);
+  });
+});
+
 test("tensor cache loads adjacent records from a Uint8Array shard", async () => {
   const backing = new Uint8Array([90, 91, 1, 2, 3, 4, 5, 6, 7, 8, 92]);
   const shard = backing.subarray(2, 10);
