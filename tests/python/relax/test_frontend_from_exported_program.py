@@ -6549,8 +6549,8 @@ def test_masked_select():
                 )
                 lv4: R.Tensor((u0,), dtype="int64") = R.squeeze(lv3, axis=[0])
                 lv5: R.Tensor((u0,), dtype="float32") = R.take(lv, lv4, axis=0, mode="fast")
-                lv6: R.Tensor((), dtype="bool") = R.const(True, "bool")
-                lv7: R.Tensor((), dtype="bool") = R.const(True, "bool")
+                lv6: R.Prim("bool") = R.prim_value(u0 >= 0)
+                lv7: R.Prim("bool") = R.prim_value(u0 <= 6)
                 gv: R.Tuple(R.Tensor((u0,), dtype="float32")) = (lv5,)
                 R.output(gv)
             return gv
@@ -9206,7 +9206,7 @@ def test_cond_shape_predicate():
             s77 = T.int64()
             R.func_attr({"tir_var_lower_bound": {"s77": 1}})
             cls = expected
-            gv: R.Tensor((), dtype="bool") = R.const(True, "bool")
+            gv: R.Prim("bool") = R.prim_value(s77 > 4)
             if gv:
                 gv1: R.Tensor((s77, 4), dtype="float32") = cls.cond_true_branch_0(x)
                 cond_result: R.Tensor((s77, 4), dtype="float32") = gv1
@@ -9224,6 +9224,59 @@ def test_cond_shape_predicate():
         dynamic_shapes={"x": {0: batch}},
         map_free_vars=True,
     )
+
+
+@pytest.mark.parametrize("comparison", ["eq", "ne", "lt", "le", "gt", "ge"])
+def test_cond_shape_predicate_executes_both_branches(comparison):
+    """One compiled symbolic model must select correctly on either side of a boundary."""
+    import operator
+
+    compare = getattr(operator, comparison)
+
+    class ShapeBranch(Module):
+        def forward(self, x):
+            return torch.cond(
+                compare(x.shape[0], 4), lambda value: value + 3, lambda value: value - 7, (x,)
+            )
+
+    model = ShapeBranch().eval()
+    exported = export(
+        model,
+        (torch.zeros(3, 2),),
+        dynamic_shapes={"x": {0: torch.export.Dim("batch", min=1, max=8)}},
+    )
+    module = from_exported_program(exported)
+    vm = relax.VirtualMachine(relax.build(module, tvm.target.Target("llvm")), tvm.cpu())
+    for batch in (1, 3, 4, 5, 8):
+        value = np.arange(batch * 2, dtype="float32").reshape(batch, 2)
+        actual = vm["main"](tvm.runtime.tensor(value))[0].numpy()
+        expected = value + 3 if compare(batch, 4) else value - 7
+        np.testing.assert_array_equal(actual, expected)
+
+
+def test_cond_nested_captured_symbolic_dimension():
+    class NestedShapeBranch(Module):
+        def forward(self, x):
+            count = x.shape[0]
+            value = x.sum(dim=0)
+
+            def short(data):
+                return torch.cond(count < 3, lambda y: y + 10, lambda y: y + 20, (data,))
+
+            return torch.cond(count < 5, short, lambda y: y + 30, (value,))
+
+    exported = export(
+        NestedShapeBranch(),
+        (torch.zeros(3, 2),),
+        dynamic_shapes={"x": {0: torch.export.Dim("batch", min=1, max=8)}},
+    )
+    module = from_exported_program(exported)
+    vm = relax.VirtualMachine(relax.build(module, tvm.target.Target("llvm")), tvm.cpu())
+    for batch in (1, 2, 3, 4, 5, 8):
+        value = np.arange(batch * 2, dtype="float32").reshape(batch, 2)
+        actual = vm["main"](tvm.runtime.tensor(value))[0].numpy()
+        offset = 10 if batch < 3 else 20 if batch < 5 else 30
+        np.testing.assert_array_equal(actual, value.sum(axis=0) + offset)
 
 
 def test_cond_tuple_output():

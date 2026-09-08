@@ -1566,8 +1566,38 @@ class ExportedProgramImporter(BaseFXGraphImporter):
 
     ########## Symbolic Shape Constraints ##########
 
-    def _symbolic_comparison(self, _: fx.Node) -> relax.Expr:
-        return self.block_builder.emit(relax.const(True, dtype="bool"))
+    def _symbolic_comparison(self, node: fx.Node) -> relax.Expr:
+        """Preserve shape predicates used by runtime control flow."""
+        lhs, rhs = self.retrieve_args(node)
+        name = node.target.__name__
+        tensor_ops = {
+            "eq": relax.op.equal,
+            "ne": relax.op.not_equal,
+            "lt": relax.op.less,
+            "le": relax.op.less_equal,
+            "gt": relax.op.greater,
+            "ge": relax.op.greater_equal,
+        }
+        if any(isinstance(getattr(value, "ty", None), relax.TensorType) for value in (lhs, rhs)):
+            return self._binary_op(tensor_ops[name], node.target)(node)
+        if isinstance(lhs, int | float | bool) and isinstance(rhs, int | float | bool):
+            return self.block_builder.emit(relax.const(node.target(lhs, rhs), dtype="bool"))
+        # Constructors need equal primitive types. Python literals must inherit
+        # the symbolic dimension's integer width; equality must not use Python
+        # object identity or the deferred truth value of a symbolic expression.
+        if isinstance(rhs, int | float | bool):
+            rhs = tvm.tirx.const(rhs, lhs.ty.dtype)
+        if isinstance(lhs, int | float | bool):
+            lhs = tvm.tirx.const(lhs, rhs.ty.dtype)
+        primitive_ops = {
+            "eq": tvm.tirx.EQ,
+            "ne": tvm.tirx.NE,
+            "lt": tvm.tirx.LT,
+            "le": tvm.tirx.LE,
+            "gt": tvm.tirx.GT,
+            "ge": tvm.tirx.GE,
+        }
+        return self.block_builder.emit(primitive_ops[name](lhs, rhs))
 
     ########## Higher-Order Ops ##########
 
@@ -2132,6 +2162,7 @@ class ExportedProgramImporter(BaseFXGraphImporter):
             "gt": self._symbolic_comparison,
             "lt": self._symbolic_comparison,
             "eq": self._symbolic_comparison,
+            "ne": self._symbolic_comparison,
             # higher-order ops
             "cond": self._cond,
         }
