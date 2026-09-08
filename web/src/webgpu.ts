@@ -19,15 +19,198 @@
 import { assert } from "./support";
 import { Pointer } from "./ctypes";
 import { Memory } from "./memory";
-import { Disposable } from "./types";
+import {
+  Disposable,
+  SampledTokenReadbackBatch,
+  SampledTokenReadbackRingOptions,
+} from "./types";
+
+// Keep ordered staging focused on small control uploads. Large writes are
+// submitted before a direct queue.writeBuffer so the staging pool cannot
+// retain model-sized buffers after initialization.
+const MAX_STAGED_UPLOAD_BYTES = 64 * 1024;
+
+// Pack per-dispatch POD arguments into aligned regions of a small number of
+// buffers. A K-token command batch can contain thousands of dispatches; one
+// GPUBuffer per dispatch creates avoidable driver objects and retained memory.
+const UNIFORM_ARENA_BYTES = 1024 * 1024;
 
 /** A pointer to points to the raw address space. */
 export type GPUPointer = number;
+
+type RuntimeTraceLevel = "major" | "verbose";
+type RuntimeTraceLane = "cpu" | "gpu";
+type RuntimeTraceValue = string | number | boolean | null;
+type RuntimeTraceMeta = Record<string, RuntimeTraceValue>;
+
+interface RuntimeTraceState {
+  enabled: boolean;
+  level: RuntimeTraceLevel;
+  devtools: "off" | "major" | "all";
+  ctx: string;
+  step?: number | string;
+  request_id?: string;
+  session_id?: string;
+  enable_gpu_timestamps?: boolean;
+}
+
+interface RuntimeTracePayload {
+  phase: string;
+  level?: RuntimeTraceLevel;
+  lane?: RuntimeTraceLane;
+  step?: number | string;
+  request_id?: string;
+  session_id?: string;
+  meta?: RuntimeTraceMeta;
+  abs_ts_ms?: number;
+  ctx?: string;
+}
+
+interface RuntimeTimestampEntry {
+  phase: string;
+  startQuery: number;
+  endQuery: number;
+  meta: RuntimeTraceMeta;
+}
+
+type ReadbackRingSlotState = "free" | "pending" | "ready";
+
+interface InternalSampledTokenReadbackSlot {
+  buffer: GPUBuffer;
+  state: ReadbackRingSlotState;
+  batchSeq: number;
+  submitSeq: number;
+  step?: number | string;
+  tokenCount: number;
+  tokens?: Int32Array;
+  pendingPromise?: Promise<void>;
+  destroyAfterComplete: boolean;
+}
+
+interface InternalReadbackRingWaiter {
+  resolve: () => void;
+  reject: (reason: unknown) => void;
+}
+
+interface InternalSampledTokenReadbackRing {
+  id: number;
+  slotCount: number;
+  maxTokensPerBatch: number;
+  slotBytes: number;
+  slots: InternalSampledTokenReadbackSlot[];
+  nextSubmitCursor: number;
+  nextBatchSeq: number;
+  nextPollSeq: number;
+  readyByBatchSeq: Map<number, number>;
+  waiters: InternalReadbackRingWaiter[];
+  disposed: boolean;
+  fatalError?: Error;
+}
+
+interface SampledTokenReadbackSource {
+  from: GPUPointer;
+  fromTokenOffset: number;
+  tokenCount: number;
+}
+
+declare global {
+  var __WEBLLM_TRACE_RUNTIME_PUSH__: ((payload: RuntimeTracePayload) => void) | undefined;
+  var __WEBLLM_TRACE_RUNTIME_STATE__: RuntimeTraceState | undefined;
+}
+
+function runtimeNowAbsMs(): number {
+  return performance.timeOrigin + performance.now();
+}
+
+function runtimeTraceLevelEnabled(level: RuntimeTraceLevel): boolean {
+  const state = globalThis.__WEBLLM_TRACE_RUNTIME_STATE__;
+  if (!state || !state.enabled) {
+    return false;
+  }
+  if (state.level === "major" && level === "verbose") {
+    return false;
+  }
+  return true;
+}
+
+function runtimeTraceGPUTimeEnabled(): boolean {
+  const state = globalThis.__WEBLLM_TRACE_RUNTIME_STATE__;
+  return !!(state?.enabled && state.enable_gpu_timestamps);
+}
+
+function runtimeTraceCurrentStep(): number | string | undefined {
+  return globalThis.__WEBLLM_TRACE_RUNTIME_STATE__?.step;
+}
+
+function runtimeTraceEmit(
+  phase: string,
+  meta: RuntimeTraceMeta = {},
+  options: {
+    level?: RuntimeTraceLevel;
+    lane?: RuntimeTraceLane;
+    step?: number | string;
+    abs_ts_ms?: number;
+  } = {},
+): void {
+  const level = options.level ?? "verbose";
+  if (!runtimeTraceLevelEnabled(level)) {
+    return;
+  }
+  const tracePush = globalThis.__WEBLLM_TRACE_RUNTIME_PUSH__;
+  if (tracePush === undefined) {
+    return;
+  }
+  tracePush({
+    phase,
+    level,
+    lane: options.lane ?? "cpu",
+    step: options.step ?? runtimeTraceCurrentStep(),
+    meta,
+    abs_ts_ms: options.abs_ts_ms ?? runtimeNowAbsMs(),
+  });
+}
+
+function parseWGSLWorkgroupSize(code: string, entryPoint: string): [number, number, number] {
+  const escapedName = entryPoint.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  let match = code.match(
+    new RegExp(
+      `@compute\\s+@workgroup_size\\(([^)]*)\\)\\s*fn\\s+${escapedName}\\b`,
+    ),
+  );
+  if (match === null) {
+    match = code.match(/@compute\s+@workgroup_size\(([^)]*)\)/);
+  }
+  if (match === null) {
+    return [1, 1, 1];
+  }
+  const dims = match[1].split(",").map((value) => {
+    const parsed = Number.parseInt(value.trim(), 10);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : 1;
+  });
+  return [dims[0] ?? 1, dims[1] ?? 1, dims[2] ?? 1];
+}
 
 export interface GPUDeviceDetectOutput {
   adapter: GPUAdapter;
   adapterInfo: GPUAdapterInfo;
   device: GPUDevice;
+}
+
+function roundUpToFourBytes(nbytes: number): number {
+  if (!Number.isSafeInteger(nbytes) || nbytes < 0) {
+    throw new Error(`Invalid WebGPU buffer size: ${nbytes}`);
+  }
+  const aligned = Math.ceil(nbytes / 4) * 4;
+  if (!Number.isSafeInteger(aligned)) {
+    throw new Error(`WebGPU buffer size is too large to align: ${nbytes}`);
+  }
+  return aligned;
+}
+
+function validateWebGPUCopyOffset(offset: number, name: string): void {
+  if (!Number.isSafeInteger(offset) || offset < 0 || offset % 4 != 0) {
+    throw new Error(`${name} must be a nonnegative multiple of four: ${offset}`);
+  }
 }
 
 /**
@@ -111,14 +294,26 @@ export async function detectGPUDevice(powerPreference: "low-power" | "high-perfo
     }
 
     const candidates = [1024, 512, 256];
-    const limit = adapter.limits.maxComputeInvocationsPerWorkgroup;
-    const requiredMaxComputeInvocationsPerWorkgroup = candidates.find(x => x <= limit) || undefined;
+    const invocationLimit = adapter.limits.maxComputeInvocationsPerWorkgroup;
+    const requiredMaxComputeInvocationsPerWorkgroup =
+      candidates.find(x => x <= invocationLimit) || undefined;
     if (requiredMaxComputeInvocationsPerWorkgroup === undefined) {
-      console.log(`No candidate fits device limit=${limit}; will rely on defaults`);
+      console.log(`No candidate fits invocation limit=${invocationLimit}; will rely on defaults`);
     } else if (requiredMaxComputeInvocationsPerWorkgroup !== 1024) {
       console.log(
         `Falling back to maxComputeInvocationsPerWorkgroup=${requiredMaxComputeInvocationsPerWorkgroup} ` +
-        `due to device limit=${limit}`
+        `due to device limit=${invocationLimit}`
+      )
+    }
+    const workgroupSizeXLimit = adapter.limits.maxComputeWorkgroupSizeX;
+    const requiredMaxComputeWorkgroupSizeX =
+      candidates.find(x => x <= workgroupSizeXLimit) || undefined;
+    if (requiredMaxComputeWorkgroupSizeX === undefined) {
+      console.log(`No candidate fits workgroup X limit=${workgroupSizeXLimit}; will rely on defaults`);
+    } else if (requiredMaxComputeWorkgroupSizeX !== 1024) {
+      console.log(
+        `Falling back to maxComputeWorkgroupSizeX=${requiredMaxComputeWorkgroupSizeX} ` +
+        `due to device limit=${workgroupSizeXLimit}`
       )
     }
 
@@ -130,6 +325,10 @@ export async function detectGPUDevice(powerPreference: "low-power" | "high-perfo
     if (adapter.features.has("subgroups")) {
       requiredFeatures.push("subgroups");
     }
+    // Enable optional timestamp queries when available to support profiling traces.
+    if (adapter.features.has("timestamp-query")) {
+      requiredFeatures.push("timestamp-query");
+    }
     // requestAdapterInfo() is deprecated, causing requestAdapterInfo to raise
     // issue when building. However, it is still needed for older browsers, hence `as any`.
     const adapterInfo = adapter.info || await (adapter as any).requestAdapterInfo();
@@ -140,6 +339,7 @@ export async function detectGPUDevice(powerPreference: "low-power" | "high-perfo
         maxComputeWorkgroupStorageSize: requiredMaxComputeWorkgroupStorageSize,
         maxStorageBuffersPerShaderStage: requiredMaxStorageBuffersPerShaderStage,
         maxComputeInvocationsPerWorkgroup: requiredMaxComputeInvocationsPerWorkgroup,
+        maxComputeWorkgroupSizeX: requiredMaxComputeWorkgroupSizeX,
       },
       requiredFeatures
     });
@@ -339,6 +539,11 @@ class CanvasRenderManager implements Disposable {
     passEncoder.draw(6, 1, 0, 0);
     passEncoder.end();
     this.device.queue.submit([commandEncoder.finish()]);
+    runtimeTraceEmit(
+      "webgpu.queue.submit",
+      { reason: "canvas_clear" },
+      { level: "verbose" },
+    );
   }
 
   draw(buffer: GPUBuffer, height: number, width: number) {
@@ -389,6 +594,15 @@ class CanvasRenderManager implements Disposable {
     passEncoder.draw(6, 1, 0, 0);
     passEncoder.end();
     this.device.queue.submit([commandEncoder.finish()]);
+    runtimeTraceEmit(
+      "webgpu.queue.submit",
+      {
+        reason: "canvas_draw",
+        width,
+        height,
+      },
+      { level: "verbose" },
+    );
   }
 
   dispose(): void {
@@ -423,15 +637,47 @@ export class WebGPUContext {
   private pendingGPUToCPUCopy: Promise<void> | null = null;
   // Whether a pending GPU→CPU copy is still the last queue operation.
   private pendingGPUToCPUCopyIsQueueTail = false;
+  // Pending read promises from sampled-token readback rings.
+  // These are tracked separately from pendingGPUToCPUCopy because ring
+  // submissions can overlap and should be awaited collectively in sync().
+  private pendingSampledTokenReadbackReads: Set<Promise<void>> = new Set();
+  private sampledTokenReadbackRings: Map<number, InternalSampledTokenReadbackRing> = new Map();
+  private nextSampledTokenReadbackRingId = 1;
   // Batched command encoding: accumulate compute passes and GPU copies in a
   // single encoder, and submit only on flush to reduce JS-native transition overhead.
   private pendingEncoder: GPUCommandEncoder | null = null;
-  // Pool of uniform buffers reused across flushes. Each dispatch in a batch
-  // gets its own buffer (indexed by pendingDispatchCount). The pool grows
-  // as needed but buffers are never destroyed — just reused next batch.
-  private uniformBufferPool: Array<GPUBuffer> = [];
-  private uniformBufferPoolSizes: Array<number> = [];
+  // Uniform arenas reused across flushes. Dispatch arguments occupy distinct,
+  // aligned regions while their command encoder is pending.
+  private uniformArenaPool: Array<GPUBuffer> = [];
+  private uniformArenaPoolSizes: Array<number> = [];
+  private pendingUniformArenaIndex = 0;
+  private pendingUniformArenaOffset = 0;
+  private pendingUniformArgumentBytes = 0;
+  private pendingUniformReservedBytes = 0;
+  // Pool of COPY_SRC buffers used to order CPU writes after commands already
+  // recorded in pendingEncoder. Each write in a batch uses a distinct slot
+  // because queue.writeBuffer executes before the command buffer is submitted.
+  private uploadBufferPool: Array<GPUBuffer> = [];
+  private uploadBufferPoolSizes: Array<number> = [];
   private pendingDispatchCount = 0;
+  private pendingGPUToGPUCopyCount = 0;
+  private pendingGPUToGPUCopyBytes = 0;
+  private pendingStagedUploadCount = 0;
+  private pendingStagedUploadBytes = 0;
+  private pendingRingStagingCopyCount = 0;
+  private pendingRingStagingCopyBytes = 0;
+  // Buffers removed from the pointer table while commands still reference
+  // them. The GPUBuffer objects remain alive until that encoder is submitted.
+  private pendingBufferDestroys: Array<GPUBuffer> = [];
+  private pendingBufferDestroyBytes = 0;
+  // Optional GPU timestamp query resources (enabled only for tracing).
+  private timestampQuerySet: GPUQuerySet | undefined = undefined;
+  private timestampResolveBuffer: GPUBuffer | undefined = undefined;
+  private timestampQueryCapacity = 0;
+  private nextTimestampQuery = 0;
+  private pendingTimestampEntries: Array<RuntimeTimestampEntry> = [];
+  private pendingTimestampRead: Promise<void> = Promise.resolve();
+  private traceSubmitCounter = 0;
   // flags for debugging
   // stats of the runtime.
   // peak allocation
@@ -450,6 +696,149 @@ export class WebGPUContext {
   constructor(memory: Memory, device: GPUDevice) {
     this.memory = memory;
     this.device = device;
+    runtimeTraceEmit(
+      "webgpu.context.create",
+      {
+        timestamp_query_supported: this.device.features.has("timestamp-query"),
+      },
+      { level: "major" },
+    );
+  }
+
+  private shouldRecordGPUTimestamps(): boolean {
+    return (
+      runtimeTraceGPUTimeEnabled() && this.device.features.has("timestamp-query")
+    );
+  }
+
+  private ensureTimestampResources(minQueryCount: number): void {
+    if (!this.shouldRecordGPUTimestamps()) {
+      return;
+    }
+    if (minQueryCount <= this.timestampQueryCapacity) {
+      return;
+    }
+    // A pending encoder may already contain passes that reference the current
+    // query set. Submit it before replacing timestamp resources; destroying a
+    // query set referenced by an unsubmitted command buffer invalidates that
+    // entire submission.
+    if (this.nextTimestampQuery !== 0) {
+      this.flushCommands();
+    }
+    assert(this.nextTimestampQuery === 0);
+    const nextCapacity = Math.max(
+      1024,
+      1 << Math.ceil(Math.log2(Math.max(minQueryCount, 2))),
+    );
+    this.timestampQuerySet?.destroy();
+    this.timestampResolveBuffer?.destroy();
+    this.timestampQuerySet = this.device.createQuerySet({
+      type: "timestamp",
+      count: nextCapacity,
+    });
+    this.timestampResolveBuffer = tryCreateBuffer(this.device, {
+      size: nextCapacity * 8,
+      usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC,
+    });
+    this.timestampQueryCapacity = nextCapacity;
+    runtimeTraceEmit(
+      "webgpu.timestamp.resources",
+      {
+        query_capacity: nextCapacity,
+      },
+      { level: "major", lane: "gpu" },
+    );
+  }
+
+  private scheduleTimestampRead(
+    queryCount: number,
+    submitAbsTsMs: number,
+    submitSeq: number,
+    entries: RuntimeTimestampEntry[],
+    readBuffer: GPUBuffer,
+    submitStep?: number | string,
+  ): void {
+    if (queryCount === 0 || entries.length === 0) {
+      readBuffer.destroy();
+      return;
+    }
+    const nbytes = queryCount * 8;
+    this.pendingTimestampRead = this.pendingTimestampRead.then(async () => {
+      let isMapped = false;
+      try {
+        runtimeTraceEmit(
+          "webgpu.timestamp.map_async.start",
+          {
+            query_count: queryCount,
+            submit_seq: submitSeq,
+          },
+          { lane: "gpu", level: "verbose", step: submitStep },
+        );
+        await readBuffer.mapAsync(GPUMapMode.READ, 0, nbytes);
+        isMapped = true;
+        const mapped = readBuffer.getMappedRange(0, nbytes);
+        const timestamps = new BigUint64Array(mapped.slice(0));
+        readBuffer.unmap();
+        isMapped = false;
+
+        let baseTs = Number.MAX_SAFE_INTEGER;
+        for (const entry of entries) {
+          baseTs = Math.min(baseTs, Number(timestamps[entry.startQuery]));
+        }
+        if (!Number.isFinite(baseTs) || baseTs === Number.MAX_SAFE_INTEGER) {
+          baseTs = 0;
+        }
+
+        for (const entry of entries) {
+          const gpuStart = Number(timestamps[entry.startQuery]);
+          const gpuEnd = Number(timestamps[entry.endQuery]);
+          const durationMs = Math.max(0, (gpuEnd - gpuStart) / 1e6);
+          const absTsMs = submitAbsTsMs + Math.max(0, (gpuStart - baseTs) / 1e6);
+          runtimeTraceEmit(
+            entry.phase,
+            {
+              ...entry.meta,
+              submit_seq: submitSeq,
+              gpu_start_tick: gpuStart,
+              gpu_end_tick: gpuEnd,
+              gpu_duration_ms: durationMs,
+            },
+            {
+              lane: "gpu",
+              level: "major",
+              abs_ts_ms: absTsMs,
+              step: submitStep,
+            },
+          );
+        }
+        runtimeTraceEmit(
+          "webgpu.timestamp.map_async.end",
+          {
+            query_count: queryCount,
+            submit_seq: submitSeq,
+          },
+          { lane: "gpu", level: "verbose", step: submitStep },
+        );
+      } catch (err) {
+        if (isMapped) {
+          try {
+            readBuffer.unmap();
+          } catch {
+            // Best-effort cleanup on map/read errors.
+          }
+        }
+        runtimeTraceEmit(
+          "webgpu.timestamp.map_async.error",
+          {
+            submit_seq: submitSeq,
+            message: String(err),
+          },
+          { lane: "gpu", level: "major", step: submitStep },
+        );
+      } finally {
+        readBuffer.destroy();
+      }
+    });
   }
 
   /**
@@ -458,18 +847,142 @@ export class WebGPUContext {
    *
    * Must be called before:
    * - GPU→CPU readback (deviceCopyFromGPU)
-   * - CPU→GPU writes (deviceCopyToGPU, copyRawBytesToBuffer)
    * - Buffer deallocation (deviceFreeDataSpace)
    * - Canvas drawing (drawImageFromBuffer)
    * - Queue sync (sync)
+   *
+   * @returns The submit sequence, or undefined when there were no pending commands.
    */
-  flushCommands(): void {
+  flushCommands(): number | undefined {
     if (this.pendingEncoder) {
-      this.device.queue.submit([this.pendingEncoder.finish()]);
+      let queryCount = 0;
+      let timestampEntries: RuntimeTimestampEntry[] = [];
+      let timestampReadBuffer: GPUBuffer | undefined;
+      if (
+        this.pendingTimestampEntries.length > 0 &&
+        this.shouldRecordGPUTimestamps() &&
+        this.timestampQuerySet !== undefined &&
+        this.timestampResolveBuffer !== undefined
+      ) {
+        queryCount = this.nextTimestampQuery;
+        timestampEntries = this.pendingTimestampEntries.slice();
+        timestampReadBuffer = tryCreateBuffer(this.device, {
+          size: queryCount * 8,
+          usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+        });
+        this.pendingEncoder.resolveQuerySet(
+          this.timestampQuerySet,
+          0,
+          queryCount,
+          this.timestampResolveBuffer,
+          0,
+        );
+        this.pendingEncoder.copyBufferToBuffer(
+          this.timestampResolveBuffer,
+          0,
+          timestampReadBuffer,
+          0,
+          queryCount * 8,
+        );
+      }
+      const submittedDispatches = this.pendingDispatchCount;
+      const submittedUniformArenaCount =
+        submittedDispatches === 0 ? 0 : this.pendingUniformArenaIndex + 1;
+      const submittedUniformArgumentBytes = this.pendingUniformArgumentBytes;
+      const submittedUniformReservedBytes = this.pendingUniformReservedBytes;
+      const submittedGPUToGPUCopies = this.pendingGPUToGPUCopyCount;
+      const submittedGPUToGPUCopyBytes = this.pendingGPUToGPUCopyBytes;
+      const submittedStagedUploads = this.pendingStagedUploadCount;
+      const submittedStagedUploadBytes = this.pendingStagedUploadBytes;
+      const submittedRingStagingCopies = this.pendingRingStagingCopyCount;
+      const submittedRingStagingCopyBytes = this.pendingRingStagingCopyBytes;
+      const submittedBufferDestroys = this.pendingBufferDestroys;
+      const submittedBufferDestroyBytes = this.pendingBufferDestroyBytes;
+      const commandBuffer = this.pendingEncoder.finish();
+      const submitAbsTsMs = runtimeNowAbsMs();
+      const submitStep = runtimeTraceCurrentStep();
+      this.device.queue.submit([commandBuffer]);
+      this.traceSubmitCounter += 1;
+      const submitSeq = this.traceSubmitCounter;
+      runtimeTraceEmit(
+        "webgpu.queue.submit",
+        {
+          submit_seq: submitSeq,
+          dispatches: submittedDispatches,
+          uniform_arena_count: submittedUniformArenaCount,
+          uniform_argument_bytes: submittedUniformArgumentBytes,
+          uniform_reserved_bytes: submittedUniformReservedBytes,
+          gpu_to_gpu_copies: submittedGPUToGPUCopies,
+          staged_upload_copies: submittedStagedUploads,
+          ring_staging_copies: submittedRingStagingCopies,
+          gpu_to_gpu_copy_bytes: submittedGPUToGPUCopyBytes,
+          staged_upload_bytes: submittedStagedUploadBytes,
+          ring_staging_copy_bytes: submittedRingStagingCopyBytes,
+          copy_bytes:
+            submittedGPUToGPUCopyBytes +
+            submittedStagedUploadBytes +
+            submittedRingStagingCopyBytes,
+          deferred_destroys: submittedBufferDestroys.length,
+          deferred_destroy_bytes: submittedBufferDestroyBytes,
+          query_count: queryCount,
+        },
+        { level: "major", step: submitStep },
+      );
+      if (queryCount > 0 && timestampReadBuffer !== undefined) {
+        this.scheduleTimestampRead(
+          queryCount,
+          submitAbsTsMs,
+          submitSeq,
+          timestampEntries,
+          timestampReadBuffer,
+          submitStep,
+        );
+      }
       this.pendingEncoder = null;
       this.pendingDispatchCount = 0;
+      this.pendingUniformArenaIndex = 0;
+      this.pendingUniformArenaOffset = 0;
+      this.pendingUniformArgumentBytes = 0;
+      this.pendingUniformReservedBytes = 0;
+      this.pendingGPUToGPUCopyCount = 0;
+      this.pendingGPUToGPUCopyBytes = 0;
+      this.pendingStagedUploadCount = 0;
+      this.pendingStagedUploadBytes = 0;
+      this.pendingRingStagingCopyCount = 0;
+      this.pendingRingStagingCopyBytes = 0;
+      this.pendingBufferDestroys = [];
+      this.pendingBufferDestroyBytes = 0;
+      this.pendingTimestampEntries = [];
+      this.nextTimestampQuery = 0;
+      for (const buffer of submittedBufferDestroys) {
+        buffer.destroy();
+      }
+      if (submittedBufferDestroys.length > 0) {
+        runtimeTraceEmit(
+          "webgpu.deferred_destroy",
+          {
+            submit_seq: submitSeq,
+            count: submittedBufferDestroys.length,
+            bytes: submittedBufferDestroyBytes,
+          },
+          { level: "verbose", step: submitStep },
+        );
+      }
+      // This submission is now the last queue operation, so the
+      // GPU→CPU copy fast path in sync() is no longer valid.
       this.pendingGPUToCPUCopyIsQueueTail = false;
+      return submitSeq;
     }
+    return undefined;
+  }
+
+  /**
+   * Submit pending commands without waiting for GPU completion.
+   *
+   * @returns Whether a command buffer was submitted.
+   */
+  submitPendingCommands(): boolean {
+    return this.flushCommands() !== undefined;
   }
 
   /**
@@ -477,19 +990,29 @@ export class WebGPUContext {
    */
   dispose() {
     this.flushCommands();
+    for (const ringId of Array.from(this.sampledTokenReadbackRings.keys())) {
+      this.disposeSampledTokenReadbackRing(ringId);
+    }
     this.canvasRenderManager?.dispose();
     this.bufferTableFreeId = [];
     while (this.bufferTable.length != 0) {
       this.bufferTable.pop()?.destroy();
     }
-    for (const buf of this.uniformBufferPool) {
+    for (const buf of this.uniformArenaPool) {
       buf.destroy();
     }
-    this.uniformBufferPool.length = 0;
-    this.uniformBufferPoolSizes.length = 0;
+    this.uniformArenaPool.length = 0;
+    this.uniformArenaPoolSizes.length = 0;
+    for (const buf of this.uploadBufferPool) {
+      buf.destroy();
+    }
+    this.uploadBufferPool.length = 0;
+    this.uploadBufferPoolSizes.length = 0;
     while (this.readStagingBufferPool.length != 0) {
       this.readStagingBufferPool.pop()?.buffer.destroy();
     }
+    this.timestampQuerySet?.destroy();
+    this.timestampResolveBuffer?.destroy();
     this.device.destroy();
   }
 
@@ -498,6 +1021,8 @@ export class WebGPUContext {
    * Wait for all pending GPU tasks to complete
    */
   async sync(): Promise<void> {
+    const syncStart = runtimeNowAbsMs();
+    runtimeTraceEmit("webgpu.sync.start", {}, { level: "verbose" });
     this.flushCommands();
 
     const pendingRead = this.pendingGPUToCPUCopy;
@@ -515,6 +1040,19 @@ export class WebGPUContext {
         await queueDone;
       }
     }
+    if (this.pendingSampledTokenReadbackReads.size > 0) {
+      await Promise.all(Array.from(this.pendingSampledTokenReadbackReads));
+    }
+    // Ensure async timestamp readbacks are finished before returning so
+    // callers can drain GPU-lane events deterministically.
+    await this.pendingTimestampRead;
+    runtimeTraceEmit(
+      "webgpu.sync.end",
+      {
+        duration_ms: runtimeNowAbsMs() - syncStart,
+      },
+      { level: "verbose" },
+    );
   }
 
   /**
@@ -525,6 +1063,321 @@ export class WebGPUContext {
     info += ", all-memory=" + Math.ceil(this.allAllocatedBytes / (1 << 20)) + " MB";
     info += ", shader-submissions=" + this.shaderSubmitCounter;
     return info;
+  }
+
+  /**
+   * Create a sampled-token readback ring.
+   *
+   * Each submission copies a contiguous int32 token vector from a GPU buffer to a
+   * per-slot MAP_READ staging buffer and starts slot-local mapAsync.
+   */
+  createSampledTokenReadbackRing(options: SampledTokenReadbackRingOptions): number {
+    const slotCount = options.slotCount ?? 3;
+    const maxTokensPerBatch = options.maxTokensPerBatch;
+    if (!Number.isInteger(slotCount) || slotCount <= 0) {
+      throw new Error(`slotCount must be a positive integer. Got ${slotCount}.`);
+    }
+    if (!Number.isInteger(maxTokensPerBatch) || maxTokensPerBatch <= 0) {
+      throw new Error(
+        `maxTokensPerBatch must be a positive integer. Got ${maxTokensPerBatch}.`,
+      );
+    }
+    const slotBytes = maxTokensPerBatch * 4; // assume int32 tokens
+    const slots: InternalSampledTokenReadbackSlot[] = [];
+    for (let i = 0; i < slotCount; ++i) {
+      slots.push({
+        buffer: tryCreateBuffer(this.device, {
+          size: slotBytes,
+          usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+        }),
+        state: "free",
+        batchSeq: 0,
+        submitSeq: 0,
+        tokenCount: 0,
+        destroyAfterComplete: false,
+      });
+    }
+    const ringId = this.nextSampledTokenReadbackRingId++;
+    this.sampledTokenReadbackRings.set(ringId, {
+      id: ringId,
+      slotCount,
+      maxTokensPerBatch,
+      slotBytes,
+      slots,
+      nextSubmitCursor: 0,
+      nextBatchSeq: 1,
+      nextPollSeq: 1,
+      readyByBatchSeq: new Map<number, number>(),
+      waiters: [],
+      disposed: false,
+    });
+    runtimeTraceEmit(
+      "webgpu.readback_ring.create",
+      {
+        ring_id: ringId,
+        slot_count: slotCount,
+        max_tokens_per_batch: maxTokensPerBatch,
+        slot_bytes: slotBytes,
+      },
+      { level: "major" },
+    );
+    return ringId;
+  }
+
+  /**
+   * Dispose a previously created sampled-token readback ring.
+   */
+  disposeSampledTokenReadbackRing(ringId: number): void {
+    const ring = this.sampledTokenReadbackRings.get(ringId);
+    if (ring === undefined) {
+      return;
+    }
+    ring.disposed = true;
+    this.sampledTokenReadbackRings.delete(ringId);
+    for (const slot of ring.slots) {
+      slot.tokens = undefined;
+      ring.readyByBatchSeq.delete(slot.batchSeq);
+      if (slot.state === "pending") {
+        slot.destroyAfterComplete = true;
+      } else {
+        slot.buffer.destroy();
+        this.resetSampledTokenReadbackSlot(slot);
+      }
+    }
+    this.notifySampledTokenReadbackRingWaiters(ring);
+    runtimeTraceEmit(
+      "webgpu.readback_ring.dispose",
+      { ring_id: ringId },
+      { level: "major" },
+    );
+  }
+
+  /**
+   * Submit a sampled-token readback batch from a GPU buffer.
+   *
+   * @param ringId Ring handle returned by createSampledTokenReadbackRing.
+   * @param from Source GPU pointer containing int32 tokens.
+   * @param fromTokenOffset Source token offset (in token units, not bytes).
+   * @param tokenCount Number of int32 token ids to copy.
+   * @returns Monotonic batch sequence id.
+   */
+  submitSampledTokenReadbackRing(
+    ringId: number,
+    from: GPUPointer,
+    fromTokenOffset: number,
+    tokenCount: number,
+  ): number {
+    return this.submitSampledTokenReadbackRingSources(ringId, [
+      { from, fromTokenOffset, tokenCount },
+    ]);
+  }
+
+  /**
+   * Submit one sampled token from each GPU pointer as one contiguous batch.
+   */
+  submitSampledTokenReadbackRingTokens(
+    ringId: number,
+    from: Array<GPUPointer>,
+  ): number {
+    if (from.length === 0) {
+      throw new Error("At least one sampled-token source is required.");
+    }
+    return this.submitSampledTokenReadbackRingSources(
+      ringId,
+      from.map((ptr) => ({ from: ptr, fromTokenOffset: 0, tokenCount: 1 })),
+    );
+  }
+
+  private submitSampledTokenReadbackRingSources(
+    ringId: number,
+    sources: Array<SampledTokenReadbackSource>,
+  ): number {
+    const ring = this.requireSampledTokenReadbackRing(ringId);
+    this.throwIfSampledTokenReadbackRingFailed(ring);
+    let tokenCount = 0;
+    for (const source of sources) {
+      if (!Number.isInteger(source.fromTokenOffset) || source.fromTokenOffset < 0) {
+        throw new Error(
+          `fromTokenOffset must be a non-negative integer. Got ${source.fromTokenOffset}.`,
+        );
+      }
+      if (!Number.isInteger(source.tokenCount) || source.tokenCount <= 0) {
+        throw new Error(
+          `tokenCount must be a positive integer. Got ${source.tokenCount}.`,
+        );
+      }
+      tokenCount += source.tokenCount;
+    }
+    if (tokenCount > ring.maxTokensPerBatch) {
+      throw new Error(
+        `tokenCount ${tokenCount} exceeds maxTokensPerBatch ${ring.maxTokensPerBatch}.`,
+      );
+    }
+    const slotIdx = this.findFreeSampledTokenReadbackSlot(ring);
+    if (slotIdx === -1) {
+      throw new Error(
+        `Sampled-token readback ring ${ring.id} is full. Drain or wait before submitting more batches.`,
+      );
+    }
+    const slot = ring.slots[slotIdx];
+    const batchSeq = ring.nextBatchSeq++;
+    const nbytes = tokenCount * 4;
+
+    const submitStep = runtimeTraceCurrentStep();
+    if (!this.pendingEncoder) {
+      this.pendingEncoder = this.device.createCommandEncoder();
+    }
+    let toByteOffset = 0;
+    for (const source of sources) {
+      const sourceBytes = source.tokenCount * 4;
+      this.pendingEncoder.copyBufferToBuffer(
+        this.gpuBufferFromPtr(source.from),
+        source.fromTokenOffset * 4,
+        slot.buffer,
+        toByteOffset,
+        sourceBytes,
+      );
+      toByteOffset += sourceBytes;
+    }
+    this.pendingRingStagingCopyCount += sources.length;
+    this.pendingRingStagingCopyBytes += nbytes;
+    const submitSeq = this.flushCommands();
+    assert(submitSeq !== undefined);
+
+    slot.state = "pending";
+    slot.batchSeq = batchSeq;
+    slot.submitSeq = submitSeq;
+    slot.step = submitStep;
+    slot.tokenCount = tokenCount;
+    slot.tokens = undefined;
+
+    runtimeTraceEmit(
+      "webgpu.readback_ring.submit",
+      {
+        ring_id: ring.id,
+        slot_idx: slotIdx,
+        batch_seq: batchSeq,
+        submit_seq: submitSeq,
+        token_count: tokenCount,
+        copy_count: sources.length,
+        copy_bytes: nbytes,
+      },
+      { level: "major", step: submitStep },
+    );
+    runtimeTraceEmit(
+      "webgpu.readback_ring.map_async.start",
+      {
+        ring_id: ring.id,
+        slot_idx: slotIdx,
+        batch_seq: batchSeq,
+        submit_seq: submitSeq,
+        bytes: nbytes,
+      },
+      { level: "major", step: submitStep },
+    );
+
+    const readPromise = slot.buffer
+      .mapAsync(GPUMapMode.READ, 0, nbytes)
+      .then(() => {
+        const mapped = slot.buffer.getMappedRange(0, nbytes);
+        const tokens = new Int32Array(mapped.slice(0, nbytes));
+        slot.buffer.unmap();
+
+        if (ring.disposed) {
+          if (slot.destroyAfterComplete) {
+            slot.buffer.destroy();
+            slot.destroyAfterComplete = false;
+          }
+          this.resetSampledTokenReadbackSlot(slot);
+          return;
+        }
+
+        slot.tokens = tokens;
+        slot.state = "ready";
+        ring.readyByBatchSeq.set(batchSeq, slotIdx);
+        runtimeTraceEmit(
+          "webgpu.readback_ring.map_async.end",
+          {
+            ring_id: ring.id,
+            slot_idx: slotIdx,
+            batch_seq: batchSeq,
+            submit_seq: submitSeq,
+            token_count: tokenCount,
+            bytes: nbytes,
+          },
+          { level: "major", step: slot.step },
+        );
+        this.notifySampledTokenReadbackRingWaiters(ring);
+      })
+      .catch((err) => {
+        try {
+          slot.buffer.unmap();
+        } catch {
+          // Best-effort cleanup.
+        }
+        if (ring.disposed) {
+          if (slot.destroyAfterComplete) {
+            slot.buffer.destroy();
+            slot.destroyAfterComplete = false;
+          }
+          this.resetSampledTokenReadbackSlot(slot);
+          return;
+        }
+        const error = err instanceof Error ? err : new Error(String(err));
+        this.resetSampledTokenReadbackSlot(slot);
+        ring.fatalError = error;
+        runtimeTraceEmit(
+          "webgpu.readback_ring.map_async.error",
+          {
+            ring_id: ring.id,
+            slot_idx: slotIdx,
+            batch_seq: batchSeq,
+            submit_seq: submitSeq,
+            message: String(error),
+          },
+          { level: "major", step: slot.step },
+        );
+        this.notifySampledTokenReadbackRingWaiters(ring, error);
+        throw error;
+      })
+      .finally(() => {
+        slot.pendingPromise = undefined;
+      });
+    slot.pendingPromise = readPromise;
+    this.trackPendingSampledTokenReadbackRead(readPromise);
+    return batchSeq;
+  }
+
+  /**
+   * Poll ready batches in sequence order.
+   */
+  pollSampledTokenReadbackRing(ringId: number): Array<SampledTokenReadbackBatch> {
+    const ring = this.requireSampledTokenReadbackRing(ringId);
+    this.throwIfSampledTokenReadbackRingFailed(ring);
+    return this.drainReadySampledTokenReadbackBatches(ring);
+  }
+
+  /**
+   * Wait until at least one batch becomes ready, then return all currently
+   * contiguous ready batches.
+   */
+  async waitSampledTokenReadbackRing(
+    ringId: number,
+  ): Promise<Array<SampledTokenReadbackBatch>> {
+    const ring = this.requireSampledTokenReadbackRing(ringId);
+    this.throwIfSampledTokenReadbackRingFailed(ring);
+    const readyNow = this.drainReadySampledTokenReadbackBatches(ring);
+    if (readyNow.length > 0) {
+      return readyNow;
+    }
+    if (!this.sampledTokenReadbackRingHasPending(ring)) {
+      return [];
+    }
+    await new Promise<void>((resolve, reject) => {
+      ring.waiters.push({ resolve, reject });
+    });
+    this.throwIfSampledTokenReadbackRingFailed(ring);
+    return this.drainReadySampledTokenReadbackBatches(ring);
   }
 
   /**
@@ -556,16 +1409,13 @@ export class WebGPUContext {
     toOffset: number,
     nbytes: number
   ): void {
-    // Flush batched compute passes before writing, to preserve execution order.
-    this.flushCommands();
-    this.device.queue.writeBuffer(
-      this.gpuBufferFromPtr(toPtr),
+    this.writeRawBytesToBuffer(
+      rawBytes,
+      toPtr,
       toOffset,
-      rawBytes as GPUAllowSharedBufferSource,
-      0,
-      nbytes
+      nbytes,
+      "copy_raw_bytes_to_buffer",
     );
-    this.pendingGPUToCPUCopyIsQueueTail = false;
   }
   /**
    * Clear canvas
@@ -610,42 +1460,153 @@ export class WebGPUContext {
   }
 
   /**
-   * Get a uniform buffer from the per-dispatch pool.
+   * Reserve an aligned region for one dispatch's POD arguments.
    *
-   * Each dispatch in a batched encoder needs its own uniform buffer because
-   * queue.writeBuffer() executes immediately while compute passes are deferred.
-   * Reusing a shared buffer would overwrite data before earlier dispatches
-   * consume it.
-   *
-   * The pool grows as needed. Buffers are reused across flushes (indexed by
-   * dispatch position within the current batch). If the pool has no slot for
-   * this dispatch, we flush first — this submits all pending passes, resets
-   * pendingDispatchCount to 0, and allows reuse from the start of the pool.
-   *
-   * State after flush: the pending encoder and all bind group / buffer
-   * references from prior dispatches are submitted and consumed. The new
-   * dispatch starts a fresh encoder, so no stale state carries over.
-   *
-   * @param nbytes Minimum buffer size in bytes.
-   * @returns A GPUBuffer with UNIFORM | COPY_DST usage, at least nbytes large.
+   * queue.writeBuffer() executes before a pending encoder is submitted, so
+   * dispatches in that encoder cannot overwrite the same region. Arenas are
+   * reused after flush; queue ordering keeps writes for the next submission
+   * behind commands that consume the previous contents.
    */
-  private getUniformFromPool(nbytes: number): GPUBuffer {
-    const dispatchIdx = this.pendingDispatchCount++;
-    if (dispatchIdx < this.uniformBufferPool.length &&
-        this.uniformBufferPoolSizes[dispatchIdx] >= nbytes) {
-      return this.uniformBufferPool[dispatchIdx];
+  private allocateUniformRegion(nbytes: number): {
+    buffer: GPUBuffer;
+    offset: number;
+  } {
+    const alignment = Math.max(
+      4,
+      this.device.limits.minUniformBufferOffsetAlignment,
+    );
+    const reservedBytes = Math.ceil(nbytes / alignment) * alignment;
+    let arenaIndex = this.pendingUniformArenaIndex;
+    let offset = this.pendingUniformArenaOffset;
+    let arenaSize = this.uniformArenaPoolSizes[arenaIndex] ?? 0;
+
+    if (arenaSize !== 0 && offset + reservedBytes > arenaSize) {
+      arenaIndex += 1;
+      offset = 0;
+      arenaSize = this.uniformArenaPoolSizes[arenaIndex] ?? 0;
     }
-    // Destroy old undersized buffer if it exists.
-    if (dispatchIdx < this.uniformBufferPool.length) {
-      this.uniformBufferPool[dispatchIdx].destroy();
+
+    const requiredArenaSize =
+      Math.ceil(Math.max(UNIFORM_ARENA_BYTES, reservedBytes) / alignment) *
+      alignment;
+    if (arenaSize < requiredArenaSize) {
+      this.uniformArenaPool[arenaIndex]?.destroy();
+      this.uniformArenaPool[arenaIndex] = this.device.createBuffer({
+        size: requiredArenaSize,
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      });
+      this.uniformArenaPoolSizes[arenaIndex] = requiredArenaSize;
+      arenaSize = requiredArenaSize;
+    }
+
+    const buffer = this.uniformArenaPool[arenaIndex];
+    assert(buffer !== undefined);
+    this.pendingUniformArenaIndex = arenaIndex;
+    this.pendingUniformArenaOffset = offset + reservedBytes;
+    this.pendingUniformArgumentBytes += nbytes;
+    this.pendingUniformReservedBytes += reservedBytes;
+    this.pendingDispatchCount += 1;
+    return { buffer, offset };
+  }
+
+  /**
+   * Get a staging buffer for a CPU→GPU write recorded in pendingEncoder.
+   *
+   * A batch cannot reuse a staging slot: queue.writeBuffer executes before
+   * submit, so reuse would overwrite bytes needed by an earlier encoded copy.
+   * Slots are reused after flush, where WebGPU queue ordering protects the
+   * previous submission from the next queue write.
+   */
+  private getUploadBufferFromPool(nbytes: number): GPUBuffer {
+    const uploadIdx = this.pendingStagedUploadCount;
+    if (
+      uploadIdx < this.uploadBufferPool.length &&
+      this.uploadBufferPoolSizes[uploadIdx] >= nbytes
+    ) {
+      return this.uploadBufferPool[uploadIdx];
+    }
+    if (uploadIdx < this.uploadBufferPool.length) {
+      this.uploadBufferPool[uploadIdx].destroy();
     }
     const buffer = this.device.createBuffer({
       size: nbytes,
-      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      usage: GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
     });
-    this.uniformBufferPool[dispatchIdx] = buffer;
-    this.uniformBufferPoolSizes[dispatchIdx] = nbytes;
+    this.uploadBufferPool[uploadIdx] = buffer;
+    this.uploadBufferPoolSizes[uploadIdx] = nbytes;
     return buffer;
+  }
+
+  /**
+   * Preserve CPU→GPU write ordering without forcing a command submission.
+   *
+   * queue.writeBuffer targets a temporary buffer immediately. The pending
+   * encoder then copies those bytes to the real destination after all commands
+   * already recorded in it and before commands recorded by the caller next.
+   */
+  private writeRawBytesToBuffer(
+    rawBytes: Uint8Array,
+    toPtr: GPUPointer,
+    toOffset: number,
+    nbytes: number,
+    reason: string,
+  ): void {
+    const destination = this.gpuBufferFromPtr(toPtr);
+    const canStage =
+      this.pendingEncoder !== null &&
+      nbytes <= MAX_STAGED_UPLOAD_BYTES &&
+      nbytes % 4 === 0 &&
+      toOffset % 4 === 0;
+    if (canStage) {
+      const uploadBuffer = this.getUploadBufferFromPool(nbytes);
+      this.device.queue.writeBuffer(
+        uploadBuffer,
+        0,
+        rawBytes as GPUAllowSharedBufferSource,
+        0,
+        nbytes,
+      );
+      this.pendingEncoder.copyBufferToBuffer(
+        uploadBuffer,
+        0,
+        destination,
+        toOffset,
+        nbytes,
+      );
+      this.pendingStagedUploadCount += 1;
+      this.pendingStagedUploadBytes += nbytes;
+      runtimeTraceEmit(
+        "webgpu.queue.write_buffer",
+        {
+          bytes: nbytes,
+          reason,
+          ptr: toPtr,
+          staged: true,
+        },
+        { level: "verbose" },
+      );
+    } else {
+      const submittedPendingCommands = this.flushCommands() !== undefined;
+      this.device.queue.writeBuffer(
+        destination,
+        toOffset,
+        rawBytes as GPUAllowSharedBufferSource,
+        0,
+        nbytes,
+      );
+      runtimeTraceEmit(
+        "webgpu.queue.write_buffer",
+        {
+          bytes: nbytes,
+          reason,
+          ptr: toPtr,
+          staged: false,
+          submitted_pending_commands: submittedPendingCommands,
+        },
+        { level: "verbose" },
+      );
+    }
+    this.pendingGPUToCPUCopyIsQueueTail = false;
   }
 
   /**
@@ -663,6 +1624,7 @@ export class WebGPUContext {
   ): Function | Promise<Function> {
     const dispatchToDim: Array<number> = [];
     let paramWriteAccess: Array<number> = [];
+    const workgroupSize = parseWGSLWorkgroupSize(code, finfo.name);
 
     for (let i = 0; i < finfo.launch_param_tags.length; ++i) {
       const tag: string = finfo.launch_param_tags[i];
@@ -720,6 +1682,14 @@ export class WebGPUContext {
     const pipelineLayout = this.device.createPipelineLayout({
       bindGroupLayouts: [bindGroupLayout]
     });
+    runtimeTraceEmit(
+      "webgpu.descriptor.setup",
+      {
+        function_name: finfo.name,
+        bindings: layoutEntries.length,
+      },
+      { level: "verbose" },
+    );
 
     // Function to create the pipeline.
     const createShaderFunc = (pipeline: GPUComputePipeline): Function => {
@@ -729,16 +1699,19 @@ export class WebGPUContext {
           this.shaderSubmitCounter += 1;
           return;
         }
+        const encodeStart = performance.now();
+        runtimeTraceEmit(
+          "webgpu.command_encode.start",
+          {
+            function_name: finfo.name,
+            shader_submit_counter: this.shaderSubmitCounter,
+          },
+          { level: "verbose" },
+        );
 
-        // Reuse a single command encoder across dispatches; only flush on sync/readback.
-        if (!this.pendingEncoder) {
-          this.pendingEncoder = this.device.createCommandEncoder();
-        }
-
-        const compute = this.pendingEncoder.beginComputePass();
-        compute.setPipeline(pipeline);
         const bindGroupEntries: Array<GPUBindGroupEntry> = [];
         const numBufferOrPodArgs = bufferArgIndices.length + podArgIndices.length;
+        let timestampEntry: RuntimeTimestampEntry | undefined = undefined;
 
         assert(args.length == numBufferOrPodArgs + dispatchToDim.length);
 
@@ -771,6 +1744,53 @@ export class WebGPUContext {
           assert(wl_x * wl_z >= packDimX);
         }
 
+        const totalWorkgroups = workDim[0] * workDim[1] * workDim[2];
+        const threadInvocations =
+          totalWorkgroups * workgroupSize[0] * workgroupSize[1] * workgroupSize[2];
+
+        if (this.shouldRecordGPUTimestamps()) {
+          this.ensureTimestampResources(this.nextTimestampQuery + 2);
+          if (this.timestampQuerySet !== undefined) {
+            const startQuery = this.nextTimestampQuery;
+            const endQuery = startQuery + 1;
+            this.nextTimestampQuery += 2;
+            timestampEntry = {
+              phase: "gpu.compute.dispatch",
+              startQuery,
+              endQuery,
+              meta: {
+                function_name: finfo.name,
+                packed_workgroups_x: packDimX,
+                workgroups_x: workDim[0],
+                workgroups_y: workDim[1],
+                workgroups_z: workDim[2],
+                workgroup_size_x: workgroupSize[0],
+                workgroup_size_y: workgroupSize[1],
+                workgroup_size_z: workgroupSize[2],
+                total_workgroups: totalWorkgroups,
+                thread_invocations: threadInvocations,
+              },
+            };
+          }
+        }
+        // Timestamp-capacity growth can flush the prior encoder. Create the
+        // encoder only after timestamp resources for this dispatch are ready.
+        if (!this.pendingEncoder) {
+          this.pendingEncoder = this.device.createCommandEncoder();
+        }
+        const computePassDescriptor =
+          timestampEntry !== undefined && this.timestampQuerySet !== undefined
+            ? {
+                timestampWrites: {
+                  querySet: this.timestampQuerySet,
+                  beginningOfPassWriteIndex: timestampEntry.startQuery,
+                  endOfPassWriteIndex: timestampEntry.endQuery,
+                },
+              }
+            : undefined;
+        const compute = this.pendingEncoder.beginComputePass(computePassDescriptor);
+        compute.setPipeline(pipeline);
+
         for (let i = 0; i < bufferArgIndices.length; ++i) {
           bindGroupEntries.push({
             binding: i,
@@ -782,7 +1802,7 @@ export class WebGPUContext {
 
         const sizeOfI32 = 4;
         const bufBytes = (podArgIndices.length + 1) * sizeOfI32;
-        const podArgBuffer = this.getUniformFromPool(bufBytes);
+        const podArgRegion = this.allocateUniformRegion(bufBytes);
         const i32View = new Int32Array(podArgIndices.length + 1);
         const u32View = new Uint32Array(i32View.buffer);
         const f32View = new Float32Array(i32View.buffer);
@@ -802,23 +1822,68 @@ export class WebGPUContext {
         }
         // always pass in dim z launching grid size in
         u32View[podArgIndices.length] = packDimX;
-        this.device.queue.writeBuffer(podArgBuffer, 0, i32View.buffer);
+        runtimeTraceEmit(
+          "webgpu.queue.write_buffer",
+          {
+            bytes: i32View.buffer.byteLength,
+            reason: "uniform_pod",
+            function_name: finfo.name,
+          },
+          { level: "verbose" },
+        );
+        this.device.queue.writeBuffer(
+          podArgRegion.buffer,
+          podArgRegion.offset,
+          i32View.buffer,
+        );
 
         bindGroupEntries.push({
           binding: bufferArgIndices.length,
           resource: {
-            buffer: podArgBuffer,
+            buffer: podArgRegion.buffer,
+            offset: podArgRegion.offset,
             size: i32View.buffer.byteLength
           }
         });
 
-        compute.setBindGroup(0, this.device.createBindGroup({
+        const bindSetupStart = performance.now();
+        const bindGroup = this.device.createBindGroup({
           layout: bindGroupLayout,
           entries: bindGroupEntries
-        }));
+        });
+        runtimeTraceEmit(
+          "webgpu.bind_group.setup",
+          {
+            function_name: finfo.name,
+            bindings: bindGroupEntries.length,
+            duration_ms: performance.now() - bindSetupStart,
+          },
+          { level: "verbose" },
+        );
+        compute.setBindGroup(0, bindGroup);
 
         compute.dispatchWorkgroups(workDim[0], workDim[1], workDim[2]);
+        if (timestampEntry !== undefined) {
+          this.pendingTimestampEntries.push(timestampEntry);
+        }
         compute.end();
+        runtimeTraceEmit(
+          "webgpu.command_encode.end",
+          {
+            function_name: finfo.name,
+            duration_ms: performance.now() - encodeStart,
+            packed_workgroups_x: packDimX,
+            workgroups_x: workDim[0],
+            workgroups_y: workDim[1],
+            workgroups_z: workDim[2],
+            workgroup_size_x: workgroupSize[0],
+            workgroup_size_y: workgroupSize[1],
+            workgroup_size_z: workgroupSize[2],
+            total_workgroups: totalWorkgroups,
+            thread_invocations: threadInvocations,
+          },
+          { level: "verbose" },
+        );
 
         // In debug mode, flush immediately so we can observe each submission.
         if (this.debugLogFinish) {
@@ -912,37 +1977,161 @@ export class WebGPUContext {
     }
   }
 
+  private requireSampledTokenReadbackRing(
+    ringId: number,
+  ): InternalSampledTokenReadbackRing {
+    const ring = this.sampledTokenReadbackRings.get(ringId);
+    if (ring === undefined || ring.disposed) {
+      throw new Error(`Cannot find sampled-token readback ring ${ringId}.`);
+    }
+    return ring;
+  }
+
+  private throwIfSampledTokenReadbackRingFailed(
+    ring: InternalSampledTokenReadbackRing,
+  ): void {
+    if (ring.fatalError !== undefined) {
+      throw ring.fatalError;
+    }
+  }
+
+  private findFreeSampledTokenReadbackSlot(
+    ring: InternalSampledTokenReadbackRing,
+  ): number {
+    for (let i = 0; i < ring.slotCount; ++i) {
+      const idx = (ring.nextSubmitCursor + i) % ring.slotCount;
+      if (ring.slots[idx].state === "free") {
+        ring.nextSubmitCursor = (idx + 1) % ring.slotCount;
+        return idx;
+      }
+    }
+    return -1;
+  }
+
+  private resetSampledTokenReadbackSlot(
+    slot: InternalSampledTokenReadbackSlot,
+  ): void {
+    slot.state = "free";
+    slot.batchSeq = 0;
+    slot.submitSeq = 0;
+    slot.step = undefined;
+    slot.tokenCount = 0;
+    slot.tokens = undefined;
+    slot.pendingPromise = undefined;
+  }
+
+  private sampledTokenReadbackRingHasPending(
+    ring: InternalSampledTokenReadbackRing,
+  ): boolean {
+    for (const slot of ring.slots) {
+      if (slot.state === "pending") {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private drainReadySampledTokenReadbackBatches(
+    ring: InternalSampledTokenReadbackRing,
+  ): Array<SampledTokenReadbackBatch> {
+    const ret: Array<SampledTokenReadbackBatch> = [];
+    while (true) {
+      const slotIdx = ring.readyByBatchSeq.get(ring.nextPollSeq);
+      if (slotIdx === undefined) {
+        break;
+      }
+      const slot = ring.slots[slotIdx];
+      if (slot.state !== "ready" || slot.tokens === undefined) {
+        break;
+      }
+      ret.push({
+        batchSeq: slot.batchSeq,
+        submitSeq: slot.submitSeq,
+        tokenCount: slot.tokenCount,
+        tokens: slot.tokens,
+      });
+      ring.readyByBatchSeq.delete(ring.nextPollSeq);
+      ring.nextPollSeq += 1;
+      this.resetSampledTokenReadbackSlot(slot);
+    }
+    return ret;
+  }
+
+  private notifySampledTokenReadbackRingWaiters(
+    ring: InternalSampledTokenReadbackRing,
+    error?: Error,
+  ): void {
+    if (ring.waiters.length === 0) {
+      return;
+    }
+    const waiters = ring.waiters.splice(0, ring.waiters.length);
+    for (const waiter of waiters) {
+      if (error !== undefined) {
+        waiter.reject(error);
+      } else {
+        waiter.resolve();
+      }
+    }
+  }
+
+  private trackPendingSampledTokenReadbackRead(readPromise: Promise<void>): void {
+    let trackedPromise: Promise<void>;
+    trackedPromise = readPromise.finally(() => {
+      this.pendingSampledTokenReadbackReads.delete(trackedPromise);
+    });
+    this.pendingSampledTokenReadbackReads.add(trackedPromise);
+  }
+
   // DeviceAPI
   private deviceAllocDataSpace(nbytes: number): GPUPointer {
-    // Storage bindings and padded host writes require a multiple of four
-    // bytes. Empty tensors can still occur as kernel arguments (for example
-    // an empty temporal tail), so keep their backing binding valid as well.
-    nbytes = Math.max(4, Math.ceil(nbytes / 4) * 4);
+    // WebGPU buffer copies and queue writes operate in four-byte units.
+    const allocationBytes = Math.max(4, roundUpToFourBytes(nbytes));
     const buffer = tryCreateBuffer(this.device, {
-      size: nbytes,
+      size: allocationBytes,
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
     });
-    this.currAllocatedBytes += nbytes;
-    this.allAllocatedBytes += nbytes;
+    this.currAllocatedBytes += buffer.size;
+    this.allAllocatedBytes += buffer.size;
     if (this.currAllocatedBytes > this.peakAllocatedBytes) {
       this.peakAllocatedBytes = this.currAllocatedBytes;
     }
     const ptr = this.attachToBufferTable(buffer);
+    runtimeTraceEmit(
+      "webgpu.temp_alloc",
+      {
+        ptr,
+        bytes: nbytes,
+        curr_allocated_bytes: this.currAllocatedBytes,
+      },
+      { level: "verbose" },
+    );
     return ptr;
   }
 
   private deviceFreeDataSpace(ptr: GPUPointer): void {
     const idx = ptr;
     const buffer = this.bufferTable[idx];
+    const deferDestroy = this.pendingEncoder !== null;
     this.bufferTable[idx] = undefined;
     assert(buffer !== undefined);
     this.bufferTableFreeId.push(idx);
     this.currAllocatedBytes -= buffer.size;
-    // Flush any pending compute passes that may reference this buffer
-    // before destroying it, otherwise queue.submit() will fail with
-    // "buffer used in submit while destroyed".
-    this.flushCommands();
-    buffer.destroy();
+    runtimeTraceEmit(
+      "webgpu.temp_free",
+      {
+        ptr,
+        bytes: buffer.size,
+        curr_allocated_bytes: this.currAllocatedBytes,
+        deferred_destroy: deferDestroy,
+      },
+      { level: "verbose" },
+    );
+    if (deferDestroy) {
+      this.pendingBufferDestroys.push(buffer);
+      this.pendingBufferDestroyBytes += buffer.size;
+    } else {
+      buffer.destroy();
+    }
   }
 
   private deviceCopyToGPU(
@@ -951,11 +2140,8 @@ export class WebGPUContext {
     toOffset: number,
     nbytes: number
   ): void {
-    // Flush batched compute passes before writing to a GPU buffer,
-    // otherwise the write may be reordered before pending dispatches
-    // that read from the same buffer.
-    this.flushCommands();
-    let rawBytes = this.memory.loadRawBytes(from, nbytes);
+    validateWebGPUCopyOffset(toOffset, "WebGPU destination offset");
+    let rawBytes = this.memory.viewRawBytes(from, nbytes);
     if (rawBytes.length % 4 !== 0) {
       // writeBuffer requires length to be multiples of 4, so we pad here
       const toPad = 4 - rawBytes.length % 4;
@@ -964,14 +2150,13 @@ export class WebGPUContext {
       rawBytes = padded;
       nbytes = nbytes + toPad;
     }
-    this.device.queue.writeBuffer(
-      this.gpuBufferFromPtr(to),
+    this.writeRawBytesToBuffer(
+      rawBytes,
+      to,
       toOffset,
-      rawBytes as GPUAllowSharedBufferSource,
-      0,
-      nbytes
+      nbytes,
+      "device_copy_to_gpu",
     );
-    this.pendingGPUToCPUCopyIsQueueTail = false;
   }
 
   /**
@@ -1016,9 +2201,24 @@ export class WebGPUContext {
     to: Pointer,
     nbytes: number
   ): void {
+    validateWebGPUCopyOffset(fromOffset, "WebGPU source offset");
     // Flush batched compute passes before the readback copy.
     this.flushCommands();
-    const gpuTemp = this.getOrCreateReadStagingBuffer(nbytes);
+    if (nbytes == 0) {
+      this.memory.storeRawBytes(to, new Uint8Array(0));
+      return;
+    }
+    const copyBytes = roundUpToFourBytes(nbytes);
+    const gpuTemp = this.getOrCreateReadStagingBuffer(copyBytes);
+    const copyStep = runtimeTraceCurrentStep();
+    runtimeTraceEmit(
+      "webgpu.staging.copy.start",
+      {
+        bytes: nbytes,
+        from_ptr: from,
+      },
+      { level: "major", step: copyStep },
+    );
 
     const copyEncoder = this.device.createCommandEncoder();
     copyEncoder.copyBufferToBuffer(
@@ -1026,16 +2226,65 @@ export class WebGPUContext {
       fromOffset,
       gpuTemp,
       0,
-      nbytes
+      copyBytes
     );
     const copyCommands = copyEncoder.finish();
+    const submitSeq = this.traceSubmitCounter + 1;
     this.device.queue.submit([copyCommands]);
+    this.traceSubmitCounter = submitSeq;
+    runtimeTraceEmit(
+      "webgpu.queue.submit",
+      {
+        submit_seq: submitSeq,
+        dispatches: 0,
+        copy_bytes: nbytes,
+        reason: "gpu_to_cpu_copy",
+      },
+      { level: "major", step: copyStep },
+    );
 
-    const readPromise = gpuTemp.mapAsync(GPUMapMode.READ).then(() => {
-      const data = gpuTemp.getMappedRange(0, nbytes);
-      this.memory.storeRawBytes(to, new Uint8Array(data));
-      this.recycleReadStagingBuffer(gpuTemp);
-    });
+    runtimeTraceEmit(
+      "webgpu.map_async.start",
+      {
+        bytes: nbytes,
+        submit_seq: submitSeq,
+      },
+      { level: "major", step: copyStep },
+    );
+    const readPromise = gpuTemp.mapAsync(GPUMapMode.READ)
+      .then(() => {
+        const data = gpuTemp.getMappedRange(0, copyBytes);
+        this.memory.storeRawBytes(to, new Uint8Array(data).subarray(0, nbytes));
+        this.recycleReadStagingBuffer(gpuTemp);
+        runtimeTraceEmit(
+          "webgpu.map_async.end",
+          {
+            bytes: nbytes,
+            submit_seq: submitSeq,
+          },
+          { level: "major", step: copyStep },
+        );
+        runtimeTraceEmit(
+          "webgpu.staging.copy.end",
+          {
+            bytes: nbytes,
+            from_ptr: from,
+          },
+          { level: "major", step: copyStep },
+        );
+      })
+      .catch((err) => {
+        runtimeTraceEmit(
+          "webgpu.map_async.error",
+          {
+            bytes: nbytes,
+            submit_seq: submitSeq,
+            message: String(err),
+          },
+          { level: "major", step: copyStep },
+        );
+        throw err;
+      });
     // Chain with any existing pending read so sync() awaits all of them.
     this.pendingGPUToCPUCopy = this.pendingGPUToCPUCopy
       ? this.pendingGPUToCPUCopy.then(() => readPromise)
@@ -1063,6 +2312,8 @@ export class WebGPUContext {
       toOffset,
       nbytes
     );
+    this.pendingGPUToGPUCopyCount += 1;
+    this.pendingGPUToGPUCopyBytes += nbytes;
   }
 
   private gpuBufferFromPtr(ptr: GPUPointer): GPUBuffer {

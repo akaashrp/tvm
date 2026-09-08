@@ -21,8 +21,12 @@
  * TVM JS Wasm Runtime library.
  */
 import { Pointer, PtrOffset, SizeOf, TypeIndex } from "./ctypes";
-import { Disposable } from "./types";
-import { Memory, CachedCallStack } from "./memory";
+import {
+  Disposable,
+  SampledTokenReadbackBatch,
+  SampledTokenReadbackRingOptions,
+} from "./types";
+import { Memory, CachedCallStack, WasmByteArraySource } from "./memory";
 import {
   assert,
   StringToUint8Array,
@@ -37,8 +41,10 @@ import {
   ArtifactCacheTemplate,
   ArtifactCacheType,
   TensorCacheAccessOptions,
+  TensorCacheEntry,
   TensorShardEntry,
   createArtifactCache,
+  getTensorCacheRecordBytes,
 } from "./artifact_cache";
 import * as compact from "./compact";
 import * as ctypes from "./ctypes";
@@ -177,6 +183,7 @@ class RuntimeContext implements Disposable {
   tensorCacheRemove: PackedFunc;
   tensorCacheClear: PackedFunc;
   arrayDecodeStorage: PackedFunc;
+  arrayDecodeBF16ToF32Inplace: PackedFunc | undefined;
   paramModuleFromCache: PackedFunc;
   paramModuleFromCacheByName: PackedFunc;
   makeShapeTuple: PackedFunc;
@@ -212,6 +219,7 @@ class RuntimeContext implements Disposable {
     this.tensorCacheUpdate = getGlobalFunc("vm.builtin.tensor_cache.update");
     this.tensorCacheClear = getGlobalFunc("vm.builtin.tensor_cache.clear");
     this.arrayDecodeStorage = getGlobalFunc("tvmjs.array.decode_storage");
+    this.arrayDecodeBF16ToF32Inplace = undefined;
     this.paramModuleFromCache = getGlobalFunc("vm.builtin.param_module_from_cache");
     this.paramModuleFromCacheByName = getGlobalFunc("vm.builtin.param_module_from_cache_by_name");
     this.makeShapeTuple = getGlobalFunc("ffi.Shape");
@@ -235,6 +243,7 @@ class RuntimeContext implements Disposable {
     this.tensorCacheRemove.dispose();
     this.tensorCacheUpdate.dispose();
     this.arrayDecodeStorage.dispose();
+    this.arrayDecodeBF16ToF32Inplace?.dispose();
     this.paramModuleFromCache.dispose();
     this.paramModuleFromCacheByName.dispose();
     this.makeShapeTuple.dispose();
@@ -345,6 +354,100 @@ const DeviceStrToEnum: Record<string, number> = {
 };
 
 /**
+ * Handle to a sampled-token readback ring created on a WebGPU device.
+ */
+export class SampledTokenReadbackRing implements Disposable {
+  private lib: FFILibrary;
+  private ringId: number;
+  private disposed = false;
+
+  constructor(lib: FFILibrary, ringId: number) {
+    this.lib = lib;
+    this.ringId = ringId;
+  }
+
+  /**
+   * Submit sampled-token readback from a GPU tensor.
+   *
+   * @param from GPU tensor containing int32 token ids.
+   * @param tokenCount Number of token ids to copy.
+   * @param fromTokenOffset Token offset (in token units) from tensor start.
+   * @returns Monotonic ring-local batch sequence id.
+   */
+  submit(from: Tensor, tokenCount: number, fromTokenOffset = 0): number {
+    return this.submitFromPointer(from.getDataPtr(), tokenCount, fromTokenOffset);
+  }
+
+  /**
+   * Submit one sampled token from each GPU tensor as one contiguous readback batch.
+   *
+   * This avoids a GPU packing kernel when speculative decode produces K separate
+   * one-token tensors.
+   *
+   * @param from GPU tensors containing one int32 token id each.
+   * @returns Monotonic ring-local batch sequence id.
+   */
+  submitTokens(from: Array<Tensor>): number {
+    const ctx = this.requireActiveWebGPUContext();
+    return ctx.submitSampledTokenReadbackRingTokens(
+      this.ringId,
+      from.map((tensor) => tensor.getDataPtr()),
+    );
+  }
+
+  /**
+   * Submit sampled-token readback from a GPU pointer.
+   */
+  submitFromPointer(fromPtr: Pointer, tokenCount: number, fromTokenOffset = 0): number {
+    const ctx = this.requireActiveWebGPUContext();
+    return ctx.submitSampledTokenReadbackRing(
+      this.ringId,
+      fromPtr,
+      fromTokenOffset,
+      tokenCount,
+    );
+  }
+
+  /**
+   * Poll ready batches in sequence order.
+   */
+  pollReady(): Array<SampledTokenReadbackBatch> {
+    const ctx = this.requireActiveWebGPUContext();
+    return ctx.pollSampledTokenReadbackRing(this.ringId);
+  }
+
+  /**
+   * Wait until at least one batch becomes ready, then poll contiguous ready batches.
+   */
+  async waitReady(): Promise<Array<SampledTokenReadbackBatch>> {
+    const ctx = this.requireActiveWebGPUContext();
+    return await ctx.waitSampledTokenReadbackRing(this.ringId);
+  }
+
+  /**
+   * Dispose ring resources.
+   */
+  dispose(): void {
+    if (this.disposed) {
+      return;
+    }
+    this.disposed = true;
+    this.lib.webGPUContext?.disposeSampledTokenReadbackRing(this.ringId);
+  }
+
+  private requireActiveWebGPUContext(): WebGPUContext {
+    if (this.disposed) {
+      throw new Error("SampledTokenReadbackRing has already been disposed");
+    }
+    const ctx = this.lib.webGPUContext;
+    if (ctx === undefined) {
+      throw new Error("WebGPU context is not available");
+    }
+    return ctx;
+  }
+}
+
+/**
  * Represent a runtime context where a Tensor can reside.
  */
 export class DLDevice {
@@ -379,6 +482,38 @@ export class DLDevice {
       assert(this.lib.webGPUContext !== undefined);
       await this.lib.webGPUContext.sync();
     }
+  }
+
+  /**
+   * Submit pending WebGPU commands without waiting for completion.
+   *
+   * @returns Whether a command buffer was submitted.
+   */
+  submitPendingCommands(): boolean {
+    if (this.deviceType !== DeviceStrToEnum.webgpu) {
+      throw new Error(
+        "Nonblocking command submission is only available on WebGPU devices.",
+      );
+    }
+    assert(this.lib.webGPUContext !== undefined);
+    return this.lib.webGPUContext.submitPendingCommands();
+  }
+
+  /**
+   * Create a sampled-token readback ring on this device.
+   *
+   * @param options Ring configuration.
+   * @returns A sampled-token readback ring handle.
+   */
+  createSampledTokenReadbackRing(
+    options: SampledTokenReadbackRingOptions,
+  ): SampledTokenReadbackRing {
+    if (this.deviceType !== DeviceStrToEnum.webgpu) {
+      throw new Error("Sampled-token readback ring is only available on WebGPU devices.");
+    }
+    assert(this.lib.webGPUContext !== undefined);
+    const ringId = this.lib.webGPUContext.createSampledTokenReadbackRing(options);
+    return new SampledTokenReadbackRing(this.lib, ringId);
   }
 
   toString(): string {
@@ -502,6 +637,15 @@ class PackedFuncCell extends TVMObject {
   }
 }
 
+interface PackedCallFrame {
+  cell: PackedFuncCell;
+  stack: CachedCallStack;
+  argsOffset: PtrOffset;
+  numArgs: number;
+  retOffset: PtrOffset;
+  released: boolean;
+}
+
 /**
  * Tensor( n-dimnesional array).
  */
@@ -545,7 +689,9 @@ export class Tensor extends TVMObject {
     const arrayOffsetDtypeLanes = arrayOffsetDtypeBits + SizeOf.U8;
     const arrayOffsetShape = arrayOffsetDtype + SizeOf.DLDataType;
     const arrayOffsetStrides = arrayOffsetShape + this.lib.sizeofPtr();
-    const arrayOffsetByteOffset = arrayOffsetStrides + this.lib.sizeofPtr();
+    const byteOffsetUnaligned = arrayOffsetStrides + this.lib.sizeofPtr();
+    const arrayOffsetByteOffset =
+      Math.ceil(byteOffsetUnaligned / SizeOf.I64) * SizeOf.I64;
     // dataPtr
     this.dataPtr = lib.memory.loadPointer(this.dltensor);
     // ndim
@@ -569,7 +715,7 @@ export class Tensor extends TVMObject {
     this.device = new DLDevice(deviceType, deviceId, lib);
 
     // byte_offset
-    this.byteOffset = lib.memory.loadI64(this.dltensor + arrayOffsetByteOffset);
+    this.byteOffset = lib.memory.loadU64(this.dltensor + arrayOffsetByteOffset);
   }
 
   /**
@@ -600,6 +746,22 @@ export class Tensor extends TVMObject {
       throw Error("Tensor has already been disposed");
     }
     return this.dataPtr;
+  }
+
+  /**
+   * Return the effective address of a CPU Tensor's storage.
+   * @returns The address in Wasm linear memory.
+   * @internal
+   */
+  getCPUDataAddress(): Pointer {
+    if (this.device.deviceType !== DeviceStrToEnum.cpu) {
+      throw new Error("Can only obtain a linear-memory address for a CPU Tensor");
+    }
+    const address = this.getDataPtr() + this.byteOffset;
+    if (!Number.isSafeInteger(address) || address < 0) {
+      throw new Error("Invalid CPU Tensor storage address");
+    }
+    return address;
   }
 
   /**
@@ -653,21 +815,49 @@ export class Tensor extends TVMObject {
    * @returns this
    */
   copyFromRawBytes(data: Uint8Array): this {
-    // short cut for gpu copy
-    if (this.device.deviceType === DeviceStrToEnum.webgpu) {
-      this.lib.webGPUContext?.copyRawBytesToBuffer(data, this.getDataPtr(), 0, data.length);
-      return this;
-    }
-    // CPU copy
-    const size = this.shape.reduce((a, b) => {
-      return a * b;
-    }, 1);
-    const nbytes = this.dlDataType.numStorageBytes() * size;
+    const nbytes = this.numStorageBytes();
     if (nbytes != data.length) {
       throw new Error("Expect the data's length equals nbytes=" + nbytes);
     }
+    // short cut for gpu copy
+    if (this.device.deviceType === DeviceStrToEnum.webgpu) {
+      if (this.byteOffset % 4 != 0 || data.length % 4 != 0) {
+        throw new Error(
+          "WebGPU raw byte copies require four-byte-aligned offsets and sizes",
+        );
+      }
+      const webGPUContext = this.lib.webGPUContext;
+      if (webGPUContext === undefined) {
+        throw new Error("WebGPU context is not initialized");
+      }
+      webGPUContext.copyRawBytesToBuffer(
+        data,
+        this.getDataPtr(),
+        this.byteOffset,
+        data.length,
+      );
+      return this;
+    }
+    // CPU copy
     this.ctx.tensorCopyFromJSBytes(this, data);
     return this;
+  }
+
+  private numStorageBytes(): number {
+    let totalBits = this.dlDataType.bits * this.dlDataType.lanes;
+    if (!Number.isSafeInteger(totalBits) || totalBits < 0) {
+      throw new Error(`Invalid tensor dtype bit width: ${totalBits}`);
+    }
+    for (const dim of this.shape) {
+      if (!Number.isSafeInteger(dim) || dim < 0) {
+        throw new Error(`Invalid tensor dimension: ${dim}`);
+      }
+      totalBits *= dim;
+      if (!Number.isSafeInteger(totalBits)) {
+        throw new Error("Tensor storage size exceeds JavaScript's safe integer range");
+      }
+    }
+    return Math.ceil(totalBits / 8);
   }
   /**
    * Return a copied Uint8Array of the raw bytes in the Tensor.
@@ -867,9 +1057,11 @@ export class Instance implements Disposable {
   private objFactory: Map<number, FObjectConstructor>;
   private ctx: RuntimeContext;
   private asyncifyHandler: AsyncifyHandler;
+  private asyncifyCallInProgress = false;
   private initProgressCallback: Array<InitProgressCallback> = [];
   private rng: LinearCongruentialGenerator;
   private deviceLostIsError = true;  // whether device.lost is due to actual error or dispose()
+  private autoDisposeOnDeviceLost = true;
   private cacheState: CacheState = new CacheState();
 
   /**
@@ -920,6 +1112,10 @@ export class Instance implements Disposable {
         // runtime context function do not auto-release.
         return this.getGlobalFuncInternal(name, autoAttachToScope);
       }
+    );
+    this.ctx.arrayDecodeBF16ToF32Inplace = this.getGlobalFuncInternalOptional(
+      "tvmjs.array.decode_bf16_to_f32_inplace",
+      /*autoAttachToScope=*/ false,
     );
     this.registerEnvGlobalPackedFuncs();
     this.registerObjectFactoryFuncs();
@@ -1015,9 +1211,11 @@ export class Instance implements Disposable {
    */
   withNewScope<T>(action: () => T): T {
     this.beginScope();
-    const val = action();
-    this.endScope();
-    return val;
+    try {
+      return action();
+    } finally {
+      this.endScope();
+    }
   }
 
   /**
@@ -1101,16 +1299,19 @@ export class Instance implements Disposable {
       const ioverride = override ? 1 : 0;
 
       const stack = this.lib.getOrAllocCallStack();
-      const nameOffset = stack.allocByteArrayForString(name);
-      stack.commitToWasmMemory();
-      this.lib.checkCall(
-        (this.lib.exports.TVMFFIFunctionSetGlobal as ctypes.FTVMFFIFunctionSetGlobal)(
-          stack.ptrFromOffset(nameOffset),
-          packedFunc._tvmPackedCell.getHandle(),
-          ioverride
-        )
-      );
-      this.lib.recycleCallStack(stack);
+      try {
+        const nameOffset = stack.allocByteArrayForString(name);
+        stack.commitToWasmMemory();
+        this.lib.checkCall(
+          (this.lib.exports.TVMFFIFunctionSetGlobal as ctypes.FTVMFFIFunctionSetGlobal)(
+            stack.ptrFromOffset(nameOffset),
+            packedFunc._tvmPackedCell.getHandle(),
+            ioverride
+          )
+        );
+      } finally {
+        this.lib.recycleCallStack(stack);
+      }
     });
   }
 
@@ -1124,23 +1325,38 @@ export class Instance implements Disposable {
   }
 
   private getGlobalFuncInternal(name: string, autoAttachToScope = true): PackedFunc {
-    const stack = this.lib.getOrAllocCallStack();
-    const nameOffset = stack.allocByteArrayForString(name);
-    const outOffset = stack.allocPtrArray(1);
-    const outPtr = stack.ptrFromOffset(outOffset);
-
-    stack.commitToWasmMemory(outOffset);
-
-    this.lib.checkCall(
-      (this.exports.TVMFFIFunctionGetGlobal as ctypes.FTVMFFIFunctionGetGlobal)(
-        stack.ptrFromOffset(nameOffset),
-        outPtr
-      )
-    );
-    const handle = this.memory.loadPointer(outPtr);
-    this.lib.recycleCallStack(stack);
-    if (handle === 0) {
+    const ret = this.getGlobalFuncInternalOptional(name, autoAttachToScope);
+    if (ret === undefined) {
       throw Error("Cannot find global function " + name);
+    }
+    return ret;
+  }
+
+  private getGlobalFuncInternalOptional(
+    name: string,
+    autoAttachToScope = true,
+  ): PackedFunc | undefined {
+    const stack = this.lib.getOrAllocCallStack();
+    let handle: Pointer;
+    try {
+      const nameOffset = stack.allocByteArrayForString(name);
+      const outOffset = stack.allocPtrArray(1);
+      const outPtr = stack.ptrFromOffset(outOffset);
+
+      stack.commitToWasmMemory(outOffset);
+
+      this.lib.checkCall(
+        (this.exports.TVMFFIFunctionGetGlobal as ctypes.FTVMFFIFunctionGetGlobal)(
+          stack.ptrFromOffset(nameOffset),
+          outPtr
+        )
+      );
+      handle = this.memory.loadPointer(outPtr);
+    } finally {
+      this.lib.recycleCallStack(stack);
+    }
+    if (handle === 0) {
+      return undefined;
     }
     const ret = this.makePackedFunc(handle);
     if (autoAttachToScope) this.ctx.attachToCurrentScope(ret);
@@ -1311,6 +1527,64 @@ export class Instance implements Disposable {
     this.cacheMetadata = { ...this.cacheMetadata, ...(list["metadata"] as Record<string, any>) };
   }
 
+  /**
+   * Consume a tensor-cache record synchronously.
+   *
+   * Keeping the borrowed record view local to this non-async helper avoids
+   * capturing it across the caller's WebGPU synchronization point.
+   */
+  private loadTensorCacheRecordData(
+    shardBytes: Uint8Array,
+    rec: TensorCacheEntry,
+    cpuArray?: Tensor,
+    gpuArray?: Tensor,
+  ): void {
+    const recBytes = getTensorCacheRecordBytes(shardBytes, rec);
+    if (cpuArray !== undefined) {
+      const isPackedBF16 =
+        rec.format === "f32-to-bf16" && rec.dtype === "float32";
+      if (isPackedBF16 && this.ctx.arrayDecodeBF16ToF32Inplace !== undefined) {
+        this.memory.storeRawBytes(cpuArray.getCPUDataAddress(), recBytes);
+        this.ctx.arrayDecodeBF16ToF32Inplace(
+          cpuArray,
+          new Scalar(recBytes.byteLength, "int64"),
+        );
+      } else {
+        this.ctx.arrayDecodeStorage(
+          cpuArray,
+          recBytes,
+          rec.format,
+          rec.dtype,
+        );
+      }
+    }
+    if (gpuArray !== undefined) {
+      if (cpuArray === undefined) {
+        gpuArray.copyFromRawBytes(recBytes);
+      } else {
+        gpuArray.copyFrom(cpuArray);
+      }
+    }
+  }
+
+  /** Return the exact byte size of a packed BF16 tensor. */
+  private getPackedBF16Bytes(shape: Array<number>): number {
+    let numElements = 1;
+    for (const dim of shape) {
+      if (!Number.isSafeInteger(dim) || dim < 0) {
+        throw new Error(`Invalid tensor dimension: ${dim}`);
+      }
+      numElements *= dim;
+      if (!Number.isSafeInteger(numElements)) {
+        throw new Error("Tensor element count exceeds JavaScript's safe integer range");
+      }
+    }
+    const nbytes = numElements * 2;
+    if (!Number.isSafeInteger(nbytes)) {
+      throw new Error("Packed BF16 size exceeds JavaScript's safe integer range");
+    }
+    return nbytes;
+  }
 
   /**
    * Fetch list of Tensor into the TensorCache.
@@ -1417,34 +1691,53 @@ export class Instance implements Disposable {
         this.env.logger("Error: Cannot fetch " + dataUrl + " err= " + err);
         throw err;
       }
+      const shardBytes =
+        buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
       const shardRecords = shard.records;
       for (let j = 0; j < shardRecords.length; ++j) {
+        let cpu_arr: Tensor | undefined;
+        let gpu_arr: Tensor | undefined;
         try {
           const rec = shardRecords[j];
-          const cpu_arr = this.withNewScope(() => {
-            return this.detachFromCurrentScope(
-              this.empty(rec.shape, rec.dtype, this.cpu())
-            )
-          });
-          const recSource = buffer.slice(rec.byteOffset, rec.byteOffset + rec.nbytes);
-          // first sync copy to cpu.
-          this.ctx.arrayDecodeStorage(cpu_arr, new Uint8Array(recSource), rec.format, rec.dtype);
-          // then async stream into GPU if needed
-          if (device.deviceType === DeviceStrToEnum.cpu) {
-            this.tensorCacheUpdate(rec.name, cpu_arr, false);
-            cpu_arr.dispose();
-          } else {
-            // allocate a gpu arr and async copy to it.
-            const gpu_arr = this.withNewScope(() => {
+          const isPackedBF16 =
+            rec.format === "f32-to-bf16" && rec.dtype === "float32";
+          if (isPackedBF16) {
+            const expectedBytes = this.getPackedBF16Bytes(rec.shape);
+            if (rec.nbytes !== expectedBytes) {
+              throw new Error(
+                `Packed BF16 record has ${rec.nbytes} bytes, ` +
+                `but shape requires ${expectedBytes}`,
+              );
+            }
+          }
+          const directToWebGPU =
+            device.deviceType === DeviceStrToEnum.webgpu &&
+            !isPackedBF16 &&
+            rec.nbytes % 4 === 0;
+
+          if (!directToWebGPU) {
+            cpu_arr = this.withNewScope(() => {
               return this.detachFromCurrentScope(
-                this.empty(rec.shape, rec.dtype, device)
-              )
+                this.empty(rec.shape, rec.dtype, this.cpu()),
+              );
             });
-            gpu_arr.copyFrom(cpu_arr);
+          }
+
+          if (device.deviceType !== DeviceStrToEnum.cpu) {
+            gpu_arr = this.withNewScope(() => {
+              return this.detachFromCurrentScope(
+                this.empty(rec.shape, rec.dtype, device),
+              );
+            });
+          }
+
+          this.loadTensorCacheRecordData(shardBytes, rec, cpu_arr, gpu_arr);
+
+          if (device.deviceType === DeviceStrToEnum.cpu) {
+            this.tensorCacheUpdate(rec.name, cpu_arr!, false);
+          } else {
             await device.sync();
             this.tensorCacheUpdate(rec.name, gpu_arr, false);
-            cpu_arr.dispose();
-            gpu_arr.dispose();
           }
         } catch (err) {
           this.env.logger(
@@ -1452,6 +1745,9 @@ export class Instance implements Disposable {
             "Error: " + err
           );
           throw err;
+        } finally {
+          cpu_arr?.dispose();
+          gpu_arr?.dispose();
         }
       }
       fetchedBytes += shard.nbytes;
@@ -1722,13 +2018,27 @@ export class Instance implements Disposable {
    */
   makeShapeTuple(shape: Array<number>): TVMObject {
     const key = CacheState.computeShapeKey(shape);
-    return this.cacheState.shapeCache.get(key, () => {
+    const cachedTuple = this.cacheState.shapeCache.get(key, () => {
       const shapeArray = shape.map((value) => new Scalar(value, "int"));
       const tuple = this.ctx.makeShapeTuple(...shapeArray);
       // Detach from scope so the cached object survives across scopes.
       this.detachFromCurrentScope(tuple);
       return tuple;
     }) as TVMObject;
+
+    // The cache owns its wrapper and may release it on eviction. Give the
+    // caller an independent strong reference with the usual scope lifetime.
+    const handle = cachedTuple.getHandle();
+    this.lib.checkCall(
+      (this.lib.exports.TVMFFIObjectIncRef as ctypes.FTVMFFIObjectIncRef)(handle)
+    );
+    const callerTuple = new TVMObject(handle, this.lib, this.ctx);
+    try {
+      return this.attachToCurrentScope(callerTuple);
+    } catch (err) {
+      callerTuple.dispose();
+      throw err;
+    }
   }
   /**
    * Get type index from type key.
@@ -1739,20 +2049,22 @@ export class Instance implements Disposable {
     typeKey: string
   ): number {
     const stack = this.lib.getOrAllocCallStack();
-    const typeKeyOffset = stack.allocByteArrayForString(typeKey);
-    const outOffset = stack.allocPtrArray(1);
-    const outPtr = stack.ptrFromOffset(outOffset);
+    try {
+      const typeKeyOffset = stack.allocByteArrayForString(typeKey);
+      const outOffset = stack.allocPtrArray(1);
+      const outPtr = stack.ptrFromOffset(outOffset);
 
-    stack.commitToWasmMemory(outOffset);
-    this.lib.checkCall(
-      (this.lib.exports.TVMFFITypeKeyToIndex as ctypes.FTVMFFITypeKeyToIndex)(
-        stack.ptrFromOffset(typeKeyOffset),
-        outPtr
-      )
-    );
-    const typeIndex = this.memory.loadU32(outPtr);
-    this.lib.recycleCallStack(stack);
-    return typeIndex;
+      stack.commitToWasmMemory(outOffset);
+      this.lib.checkCall(
+        (this.lib.exports.TVMFFITypeKeyToIndex as ctypes.FTVMFFITypeKeyToIndex)(
+          stack.ptrFromOffset(typeKeyOffset),
+          outPtr
+        )
+      );
+      return this.memory.loadU32(outPtr);
+    } finally {
+      this.lib.recycleCallStack(stack);
+    }
   }
 
   /**
@@ -1789,8 +2101,52 @@ export class Instance implements Disposable {
    * @returns The wrapped AsyncPackedFunc
    */
   wrapAsyncifyPackedFunc(func: PackedFunc): AsyncPackedFunc {
-    const asyncFunc = this.asyncifyHandler.wrapExport(func) as AsyncPackedFunc;
-    asyncFunc.dispose = func.dispose;
+    let callInProgress = false;
+    let disposeRequested = false;
+    const asyncFunc = (async (...args: Array<any>): Promise<any> => {
+      if (this.asyncifyCallInProgress) {
+        throw new Error("Another Asyncify packed function is already running");
+      }
+      if (disposeRequested || func._tvmPackedCell.getHandle(false) === 0) {
+        throw new Error("Asyncify packed function has already been disposed");
+      }
+
+      callInProgress = true;
+      this.asyncifyCallInProgress = true;
+      let frame: PackedCallFrame | undefined;
+      try {
+        frame = this.preparePackedCall(func._tvmPackedCell, args);
+        // Every rewind must enter TVMFFIFunctionCall with the same argument and
+        // return storage.  In particular, the Wasm stack may retain pointers
+        // into transient byte arguments while its execution is suspended.
+        const run = this.asyncifyHandler.wrapExport(
+          () => this.invokePackedCall(frame as PackedCallFrame)
+        );
+        return await run();
+      } finally {
+        try {
+          if (frame !== undefined) {
+            this.releasePackedCall(frame);
+          }
+        } finally {
+          callInProgress = false;
+          this.asyncifyCallInProgress = false;
+          if (disposeRequested) {
+            func.dispose();
+          }
+        }
+      }
+    }) as AsyncPackedFunc;
+    asyncFunc.dispose = (): void => {
+      if (func._tvmPackedCell.getHandle(false) === 0 || disposeRequested) {
+        return;
+      }
+      if (callInProgress) {
+        disposeRequested = true;
+      } else {
+        func.dispose();
+      }
+    };
     asyncFunc._tvmPackedCell = func._tvmPackedCell;
     return asyncFunc;
   }
@@ -1920,7 +2276,7 @@ export class Instance implements Disposable {
     });
 
     device.lost.then((info: any) => {
-      if (this.deviceLostIsError) {
+      if (this.deviceLostIsError && this.autoDisposeOnDeviceLost) {
         console.error("Device lost, calling Instance.dispose(). Please initialize again. ", info);
         this.dispose();
       }
@@ -1946,6 +2302,17 @@ export class Instance implements Disposable {
       });
     }
     this.lib.webGPUContext = webGPUContext;
+  }
+
+  /**
+   * Configure automatic disposal after WebGPU device loss.
+   *
+   * External owners should disable automatic disposal after initialization if
+   * they serialize disposal with active runtime calls.
+   * @param enabled Whether device loss should immediately dispose this instance.
+   */
+  setDeviceLostAutoDispose(enabled: boolean): void {
+    this.autoDisposeOnDeviceLost = enabled;
   }
 
   /** Register all object factory */
@@ -2041,18 +2408,20 @@ export class Instance implements Disposable {
     this.env.packedCFuncTable[findex] = func;
 
     const stack = this.lib.getOrAllocCallStack();
-    const outOffset = stack.allocPtrArray(1);
-    const outPtr = stack.ptrFromOffset(outOffset);
-    this.lib.checkCall(
-      (this.exports
-        .TVMFFIWasmFunctionCreate as ctypes.FTVMFFIWasmFunctionCreate)(
-          findex,
-          outPtr
-        )
-    );
-    const ret = this.makePackedFunc(this.memory.loadPointer(outPtr));
-    this.lib.recycleCallStack(stack);
-    return ret;
+    try {
+      const outOffset = stack.allocPtrArray(1);
+      const outPtr = stack.ptrFromOffset(outOffset);
+      this.lib.checkCall(
+        (this.exports
+          .TVMFFIWasmFunctionCreate as ctypes.FTVMFFIWasmFunctionCreate)(
+            findex,
+            outPtr
+          )
+      );
+      return this.makePackedFunc(this.memory.loadPointer(outPtr));
+    } finally {
+      this.lib.recycleCallStack(stack);
+    }
   }
 
   /**
@@ -2067,6 +2436,7 @@ export class Instance implements Disposable {
     stack: CachedCallStack,
     args: Array<any>,
     packedArgs: PtrOffset,
+    wasmByteSources?: Array<WasmByteArraySource | undefined>,
   ): void {
     for (let i = 0; i < args.length; ++i) {
       let val = args[i];
@@ -2128,7 +2498,7 @@ export class Instance implements Disposable {
         stack.allocThenSetArgString(argValueOffset, val);
       } else if (val instanceof Uint8Array) {
         stack.storeI32(argTypeIndexOffset, TypeIndex.kTVMFFIByteArrayPtr);
-        stack.allocThenSetArgBytes(argValueOffset, val);
+        stack.allocThenSetArgBytes(argValueOffset, val, wasmByteSources?.[i]);
       } else if (val instanceof Function) {
         val = this.toPackedFuncInternal(val, false);
         stack.tempArgs.push(val);
@@ -2154,98 +2524,100 @@ export class Instance implements Disposable {
       numArgs: number,
       ret: Pointer
     ): number => {
-      const jsArgs = [];
-      // use scope to track js values.
-      this.ctx.beginScope();
-      for (let i = 0; i < numArgs; ++i) {
-        const argPtr = packedArgs + i * SizeOf.TVMFFIAny;
-        const typeIndex = lib.memory.loadI32(argPtr);
-
-        if (typeIndex >= TypeIndex.kTVMFFIRawStr) {
-          // NOTE: the following code have limitations in asyncify mode.
-          // The reason is that the TVMFFIAnyViewToOwnedAny will simply
-          // get skipped during the rewinding process, causing memory failure
-          if (!this.asyncifyHandler.isNormalStackState()) {
-            throw Error("Cannot handle str/object argument callback in asyncify mode");
-          }
-          lib.checkCall(
-            (lib.exports.TVMFFIAnyViewToOwnedAny as ctypes.FTVMFFIAnyViewToOwnedAny)(
-              argPtr,
-              argPtr
-            )
-          );
-        }
-        jsArgs.push(this.retValueToJS(argPtr, true));
-      }
-
       let rv: any;
       try {
-        rv = func(...jsArgs);
+        // use scope to track js values.
+        this.ctx.beginScope();
+        try {
+          const jsArgs = [];
+          for (let i = 0; i < numArgs; ++i) {
+            const argPtr = packedArgs + i * SizeOf.TVMFFIAny;
+            const typeIndex = lib.memory.loadI32(argPtr);
+
+            if (typeIndex >= TypeIndex.kTVMFFIRawStr) {
+              // NOTE: the following code have limitations in asyncify mode.
+              // The reason is that the TVMFFIAnyViewToOwnedAny will simply
+              // get skipped during the rewinding process, causing memory failure
+              if (!this.asyncifyHandler.isNormalStackState()) {
+                throw Error("Cannot handle str/object argument callback in asyncify mode");
+              }
+              lib.checkCall(
+                (lib.exports.TVMFFIAnyViewToOwnedAny as ctypes.FTVMFFIAnyViewToOwnedAny)(
+                  argPtr,
+                  argPtr
+                )
+              );
+            }
+            jsArgs.push(this.retValueToJS(argPtr, true));
+          }
+          rv = func(...jsArgs);
+        } finally {
+          // recycle all js object values created for the callback.
+          this.ctx.endScope();
+        }
+
+        if (rv !== undefined && rv !== null) {
+          const wasmByteSources = this.captureWasmByteSources([rv]);
+          const stack = lib.getOrAllocCallStack();
+          try {
+            const argOffset = stack.allocRawBytes(SizeOf.TVMFFIAny);
+            this.setPackedArguments(stack, [rv], argOffset, wasmByteSources);
+            stack.commitToWasmMemory();
+            const argPtr = stack.ptrFromOffset(argOffset);
+            lib.checkCall(
+              (lib.exports.TVMFFIAnyViewToOwnedAny as ctypes.FTVMFFIAnyViewToOwnedAny)(
+                argPtr,
+                ret
+              )
+            );
+          } finally {
+            lib.recycleCallStack(stack);
+          }
+        }
+        return 0;
       } catch (error) {
-        // error handling
-        // store error via SetLastError
-        this.ctx.endScope();
-        const errKind = "JSCallbackError"
-        const errMsg = error.message;
-        const stack = lib.getOrAllocCallStack();
-        const errKindOffset = stack.allocRawBytes(errKind.length + 1);
-        stack.storeRawBytes(errKindOffset, StringToUint8Array(errKind));
-        const errMsgOffset = stack.allocRawBytes(errMsg.length + 1);
-        stack.storeRawBytes(errMsgOffset, StringToUint8Array(errMsg));
-        stack.commitToWasmMemory();
-        (this.lib.exports.TVMFFIErrorSetRaisedFromCStr as ctypes.FTVMFFIErrorSetRaisedFromCStr)(
-          stack.ptrFromOffset(errKindOffset),
-          stack.ptrFromOffset(errMsgOffset)
-        );
-        this.lib.recycleCallStack(stack);
+        try {
+          this.setCallbackError(error);
+        } catch (reportError) {
+          this.env.logger(
+            `Failed to report JS callback error: ${String(reportError)}`
+          );
+        }
         return -1;
       }
-
-      // normal return path
-      // recycle all js object value in function unless we want to retain them.
-      this.ctx.endScope();
-      if (rv !== undefined && rv !== null) {
-        const stack = lib.getOrAllocCallStack();
-        const argOffset = stack.allocRawBytes(SizeOf.TVMFFIAny);
-        this.setPackedArguments(stack, [rv], argOffset);
-        stack.commitToWasmMemory();
-        const argPtr = stack.ptrFromOffset(argOffset);
-        lib.checkCall(
-          (lib.exports.TVMFFIAnyViewToOwnedAny as ctypes.FTVMFFIAnyViewToOwnedAny)(
-            argPtr,
-            ret
-          )
-        );
-        lib.recycleCallStack(stack);
-      }
-      return 0;
     };
+  }
+
+  private setCallbackError(error: unknown): void {
+    const errKind = "JSCallbackError";
+    const errMsg = error instanceof Error ? error.message : String(error);
+    const errKindBytes = StringToUint8Array(errKind);
+    const errMsgBytes = StringToUint8Array(errMsg);
+    const stack = this.lib.getOrAllocCallStack();
+    try {
+      const errKindOffset = stack.allocRawBytes(errKindBytes.byteLength);
+      stack.storeRawBytes(errKindOffset, errKindBytes);
+      const errMsgOffset = stack.allocRawBytes(errMsgBytes.byteLength);
+      stack.storeRawBytes(errMsgOffset, errMsgBytes);
+      stack.commitToWasmMemory();
+      (this.lib.exports.TVMFFIErrorSetRaisedFromCStr as ctypes.FTVMFFIErrorSetRaisedFromCStr)(
+        stack.ptrFromOffset(errKindOffset),
+        stack.ptrFromOffset(errMsgOffset)
+      );
+    } finally {
+      this.lib.recycleCallStack(stack);
+    }
   }
 
   private makePackedFunc(handle: Pointer): PackedFunc {
     const cell = new PackedFuncCell(handle, this.lib, this.ctx);
     const packedFunc = (...args: any): any => {
-      const stack = this.lib.getOrAllocCallStack();
-      const argsOffset = stack.allocRawBytes(SizeOf.TVMFFIAny * args.length);
-      this.setPackedArguments(stack, args, argsOffset);
-      const retOffset = stack.allocRawBytes(SizeOf.TVMFFIAny);
-      // pre-store the result to be null
-      stack.storeI32(retOffset, TypeIndex.kTVMFFINone);
-      // clear off the extra zero padding before ptr storage
-      stack.storeI32(retOffset + SizeOf.I32, 0);
-      stack.commitToWasmMemory();
-      this.lib.checkCall(
-        (this.exports.TVMFFIFunctionCall as ctypes.FTVMFFIFunctionCall)(
-          cell.getHandle(),
-          stack.ptrFromOffset(argsOffset),
-          args.length,
-          stack.ptrFromOffset(retOffset)
-        )
-      );
-
-      const ret = this.retValueToJS(stack.ptrFromOffset(retOffset), false);
-      this.lib.recycleCallStack(stack);
-      return ret;
+      const frame = this.preparePackedCall(cell, args);
+      try {
+        return this.invokePackedCall(frame);
+      } finally {
+        this.releasePackedCall(frame);
+      }
     };
     // Attach attributes to the function type.
     // This is because javascript do not allow us to overload call.
@@ -2255,6 +2627,94 @@ export class Instance implements Disposable {
     };
     ret._tvmPackedCell = cell;
     return ret as PackedFunc;
+  }
+
+  private preparePackedCall(cell: PackedFuncCell, args: Array<any>): PackedCallFrame {
+    // Capture Wasm-backed views before either call-stack or transient
+    // allocation can grow memory and detach them.
+    const wasmByteSources = this.captureWasmByteSources(args);
+    const stack = this.lib.getOrAllocCallStack();
+    let retainedCell: PackedFuncCell | undefined;
+    try {
+      const handle = cell.getHandle();
+      this.lib.checkCall(
+        (this.exports.TVMFFIObjectIncRef as ctypes.FTVMFFIObjectIncRef)(handle)
+      );
+      retainedCell = new PackedFuncCell(handle, this.lib, this.ctx);
+      const argsOffset = stack.allocRawBytes(SizeOf.TVMFFIAny * args.length);
+      this.setPackedArguments(stack, args, argsOffset, wasmByteSources);
+      const retOffset = stack.allocRawBytes(SizeOf.TVMFFIAny);
+      // pre-store the result to be null
+      stack.storeI32(retOffset, TypeIndex.kTVMFFINone);
+      // clear off the extra zero padding before ptr storage
+      stack.storeI32(retOffset + SizeOf.I32, 0);
+      stack.commitToWasmMemory();
+      return {
+        cell: retainedCell,
+        stack,
+        argsOffset,
+        numArgs: args.length,
+        retOffset,
+        released: false,
+      };
+    } catch (error) {
+      try {
+        this.lib.recycleCallStack(stack);
+      } finally {
+        retainedCell?.dispose();
+      }
+      throw error;
+    }
+  }
+
+  private invokePackedCall(frame: PackedCallFrame): any {
+    if (frame.released) {
+      throw new Error("Cannot invoke a released packed-call frame");
+    }
+    this.lib.checkCall(
+      (this.exports.TVMFFIFunctionCall as ctypes.FTVMFFIFunctionCall)(
+        frame.cell.getHandle(),
+        frame.stack.ptrFromOffset(frame.argsOffset),
+        frame.numArgs,
+        frame.stack.ptrFromOffset(frame.retOffset)
+      )
+    );
+    if (!this.asyncifyHandler.isNormalStackState()) {
+      return undefined;
+    }
+    return this.retValueToJS(frame.stack.ptrFromOffset(frame.retOffset), false);
+  }
+
+  private releasePackedCall(frame: PackedCallFrame): void {
+    if (!frame.released) {
+      frame.released = true;
+      try {
+        this.lib.recycleCallStack(frame.stack);
+      } finally {
+        frame.cell.dispose();
+      }
+    }
+  }
+
+  private captureWasmByteSources(
+    args: Array<any>
+  ): Array<WasmByteArraySource | undefined> | undefined {
+    const wasmBuffer = this.memory.memory.buffer;
+    let sources: Array<WasmByteArraySource | undefined> | undefined;
+    for (let i = 0; i < args.length; ++i) {
+      const arg = args[i];
+      if (arg instanceof Uint8Array && arg.buffer === wasmBuffer) {
+        if (sources === undefined) {
+          sources = new Array(args.length);
+        }
+        sources[i] = {
+          buffer: wasmBuffer,
+          byteOffset: arg.byteOffset,
+          byteLength: arg.byteLength,
+        };
+      }
+    }
+    return sources;
   }
 
   /**
