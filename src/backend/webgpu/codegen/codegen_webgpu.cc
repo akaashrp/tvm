@@ -180,6 +180,7 @@ std::string CodeGenWebGPU::Finish() {
 void CodeGenWebGPU::InitFuncState(const PrimFunc& f) {
   CodeGenC::InitFuncState(f);
   workgroup_memory_bytes_ = 0;
+  atomic_workgroup_buffers_.clear();
   // analyze the data;
   for (Var arg : f->params) {
     if (arg->ty.as<PointerTypeNode>()) {
@@ -613,6 +614,25 @@ void CodeGenWebGPU::VisitExpr_(const FloatImmNode* op, std::ostream& os) {  // N
   os << temp.str();
 }
 
+void CodeGenWebGPU::PrintBufferScalarLoad(const std::string& buffer, const std::string& index,
+                                          std::ostream& os) {
+  if (atomic_workgroup_buffers_.count(buffer)) {
+    os << "bitcast<f32>(atomicLoad(&" << buffer << "[" << index << "]))";
+  } else {
+    os << buffer << "[" << index << "]";
+  }
+}
+
+void CodeGenWebGPU::PrintBufferScalarStore(const std::string& buffer, const std::string& index,
+                                           const std::string& value) {
+  PrintIndent();
+  if (atomic_workgroup_buffers_.count(buffer)) {
+    stream << "atomicStore(&" << buffer << "[" << index << "], bitcast<u32>(" << value << "));\n";
+  } else {
+    stream << buffer << "[" << index << "] = " << value << ";\n";
+  }
+}
+
 void CodeGenWebGPU::VisitExpr_(const BufferLoadNode* op, std::ostream& os) {  // NOLINT(*)
   // NOTE: direct impl of load/store for correctness
   // Each printing stmt must stand on their own after all preprocessing steps
@@ -639,7 +659,7 @@ void CodeGenWebGPU::VisitExpr_(const BufferLoadNode* op, std::ostream& os) {  //
       TVM_FFI_ICHECK(value_ty == element_ty);
     }
     TVM_FFI_ICHECK_EQ(index.ty().lanes(), 1);
-    os << buffer_vid << "[" << this->PrintExpr(index) << "]";
+    PrintBufferScalarLoad(buffer_vid, PrintExpr(index), os);
     // Special handle bool loading
     if (value_ty == PrimType::Bool()) {
       os << ")";
@@ -657,7 +677,7 @@ void CodeGenWebGPU::VisitExpr_(const BufferLoadNode* op, std::ostream& os) {  //
       os << "(";
       for (int i = 0; i < lanes; ++i) {
         if (i != 0) os << ", ";
-        os << buffer_vid << "[" << base_vid << " + " << i << "]";
+        PrintBufferScalarLoad(buffer_vid, base_vid + " + " + std::to_string(i), os);
       }
       os << ")";
     } else {
@@ -667,7 +687,7 @@ void CodeGenWebGPU::VisitExpr_(const BufferLoadNode* op, std::ostream& os) {  //
       os << "(";
       for (int i = 0; i < lanes; ++i) {
         if (i != 0) os << ", ";
-        os << buffer_vid << "[" << index_vid << "[" << i << "]]";
+        PrintBufferScalarLoad(buffer_vid, index_vid + "[" + std::to_string(i) + "]", os);
       }
       os << ")";
     }
@@ -705,6 +725,11 @@ void CodeGenWebGPU::VisitStmt_(const BufferStoreNode* op) {
     // so we won't have recursive append to stream
     std::string index_vid = PrintExpr(index);
     std::string value_vid = PrintExpr(op->value);
+    if (atomic_workgroup_buffers_.count(buffer_vid)) {
+      TVM_FFI_ICHECK(value_ty == PrimType::Float(32) && element_ty == value_ty);
+      PrintBufferScalarStore(buffer_vid, index_vid, value_vid);
+      return;
+    }
     // now print the assignment line.
     this->PrintIndent();
     stream << buffer_vid << "[" << index_vid << "] = ";
@@ -733,18 +758,16 @@ void CodeGenWebGPU::VisitStmt_(const BufferStoreNode* op) {
       // buf[base + 1] = value[1]
       std::string base_vid = SSAGetID(PrintExpr(base.Eval()), base.Eval().ty());
       for (int i = 0; i < value_ty.lanes(); ++i) {
-        this->PrintIndent();
-        stream << buffer_vid << "[" << base_vid << " + " << i << "] = " << value_vid << "[" << i
-               << "];\n";
+        PrintBufferScalarStore(buffer_vid, base_vid + " + " + std::to_string(i),
+                               value_vid + "[" + std::to_string(i) + "]");
       }
     } else {
       // buf[index[0]] = value[0]
       // buf[index[1]] = value[1]
       std::string index_vid = SSAGetID(PrintExpr(index), index.ty());
       for (int i = 0; i < value_ty.lanes(); ++i) {
-        this->PrintIndent();
-        stream << buffer_vid << "[" << index_vid << "[" << i << "]] = " << value_vid << "[" << i
-               << "];\n";
+        PrintBufferScalarStore(buffer_vid, index_vid + "[" + std::to_string(i) + "]",
+                               value_vid + "[" + std::to_string(i) + "]");
       }
     }
   }
@@ -791,7 +814,16 @@ void CodeGenWebGPU::VisitStmt_(const AllocBufferNode* op) {
         << " bytes. If the adapter supports this allocation, set "
            "max_shared_memory_per_block in the WebGPU target configuration.";
     this->decl_stream << "var<workgroup> " << vid << " : array<";
-    PrintType(op->buffer->dtype, this->decl_stream);
+    if (constant_size == 1 && op->buffer->dtype == PrimType::Float(32)) {
+      // Some Metal drivers miscompile Naga's scalar threadgroup broadcasts,
+      // yielding non-uniform values even across workgroup barriers (#4500 in
+      // gfx-rs/wgpu). Atomic storage prevents the faulty scalar-load motion.
+      // Bitcasts preserve the f32 value; the existing barriers remain required.
+      atomic_workgroup_buffers_.insert(vid);
+      this->decl_stream << "atomic<u32>";
+    } else {
+      PrintType(op->buffer->dtype, this->decl_stream);
+    }
     this->decl_stream << ", " << constant_size << ">;\n";
   } else if (storage_scope.rank == runtime::StorageRank::kLocal) {
     this->PrintIndent();

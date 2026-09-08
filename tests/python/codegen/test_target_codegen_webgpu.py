@@ -42,6 +42,45 @@ def test_codegen_buffer_access_modes():
     assert "var<storage, read_write> B_ptr" in source
 
 
+def test_scalar_workgroup_float_broadcast_uses_atomic_bits():
+    """A barrier must publish the same scalar f32 bits to every SIMD group."""
+
+    @I.ir_module(s_tir=True)
+    class Module:
+        @T.prim_func(s_tir=True)
+        def main(A: T.Buffer((1,), "float32"), B: T.Buffer((64,), "float32")):
+            for tx in T.thread_binding(64, thread="threadIdx.x"):
+                shared = T.alloc_buffer((1,), "float32", scope="shared")
+                if tx == 0:
+                    shared[0] = A[0]
+                T.evaluate(T.tvm_storage_sync("shared"))
+                B[tx] = shared[0]
+
+    executable = tvm.compile(Module, target="webgpu")
+    source = executable.mod.imports[0].inspect_source("wgsl")
+    assert re.search(r"var<workgroup> \w+ : array<atomic<u32>, 1>;", source)
+    assert "atomicStore(&" in source and "bitcast<u32>(" in source
+    assert "bitcast<f32>(atomicLoad(&" in source
+    assert "workgroupBarrier();" in source
+
+
+def test_larger_workgroup_array_retains_plain_float_storage():
+    @I.ir_module(s_tir=True)
+    class Module:
+        @T.prim_func(s_tir=True)
+        def main(A: T.Buffer((64,), "float32"), B: T.Buffer((64,), "float32")):
+            for tx in T.thread_binding(64, thread="threadIdx.x"):
+                shared = T.alloc_buffer((64,), "float32", scope="shared")
+                shared[tx] = A[tx]
+                T.evaluate(T.tvm_storage_sync("shared"))
+                B[tx] = shared[(tx + 1) % 64]
+
+    executable = tvm.compile(Module, target="webgpu")
+    source = executable.mod.imports[0].inspect_source("wgsl")
+    assert re.search(r"var<workgroup> \w+ : array<f32, 64>;", source)
+    assert "atomicLoad" not in source and "atomicStore" not in source
+
+
 def test_codegen_nonfinite_float_literals():
     @I.ir_module(s_tir=True)
     class Module:

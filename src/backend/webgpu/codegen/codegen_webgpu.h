@@ -31,6 +31,7 @@
 
 #include <cstddef>
 #include <string>
+#include <unordered_set>
 
 #include "../../../target/source/codegen_c.h"
 
@@ -90,6 +91,9 @@ class CodeGenWebGPU final : public CodeGenC {
    * \brief Enforce value to be U32.
    */
   static PrimExpr EnforceU32(PrimExpr value);
+  void PrintBufferScalarLoad(const std::string& buffer, const std::string& index, std::ostream& os);
+  void PrintBufferScalarStore(const std::string& buffer, const std::string& index,
+                              const std::string& value);
   /*!
    * \brief Storage type of bool values.
    */
@@ -104,6 +108,8 @@ class CodeGenWebGPU final : public CodeGenC {
 
   /*! \brief Total bytes declared in the WGSL workgroup address space. */
   size_t workgroup_memory_bytes_{0};
+  /*! \brief Scalar f32 workgroup broadcasts use atomic bit-preserving storage. */
+  std::unordered_set<std::string> atomic_workgroup_buffers_;
 
   /*! \brief the header stream for function label and enable directive if any, goes before any other
    * declaration */
