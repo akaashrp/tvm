@@ -5954,7 +5954,7 @@ def test_dynamic_scalar_item_in_shape_operations():
 
     script = mod.script()
     assert "R.tensor_to_shape" in script
-    assert "R.shape_to_tensor" in script
+    assert "scalar_tensor" in script
 
     executable = relax.build(mod, tvm.target.Target("llvm"))
     vm = relax.VirtualMachine(executable, tvm.cpu())
@@ -5963,6 +5963,44 @@ def test_dynamic_scalar_item_in_shape_operations():
         expected = DynamicShapeOps()(torch_input)
         actual = vm["main"](tvm.runtime.tensor(torch_input.numpy()))
         for actual_value, expected_value in zip(actual, expected):
+            np.testing.assert_array_equal(actual_value.numpy(), expected_value.numpy())
+
+
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64, torch.float16, torch.float32])
+def test_dynamic_full_materializes_requested_dtype(dtype):
+    class DynamicFull(torch.nn.Module):
+        def forward(self, x):
+            filled = torch.full((x.shape[0],), 2 * x.shape[0] - 7, dtype=dtype)
+            return filled, torch.full_like(filled, 3 - x.shape[0])
+
+    model = DynamicFull()
+    length = torch.export.Dim("length", min=2, max=8)
+    exported_program = export(
+        model,
+        args=(torch.randn(4),),
+        dynamic_shapes={"x": {0: length}},
+    )
+    mod = from_exported_program(exported_program)
+    # The import itself must not materialize an intermediate int64 tensor.
+    # Shape scalars may remain int64, and explicitly requested int64 outputs
+    # must keep their type.
+    assert "R.shape_to_tensor" not in mod.script()
+    scalar_functions = [
+        func for name, func in mod.functions.items() if name.name_hint.startswith("scalar_tensor")
+    ]
+    assert scalar_functions
+    expected_dtype = str(dtype).removeprefix("torch.")
+    for func in scalar_functions:
+        assert f'"{expected_dtype}"' in func.script()
+        if dtype != torch.int64:
+            assert '"int64"' not in func.script()
+
+    executable = relax.build(mod, tvm.target.Target("llvm"))
+    vm = relax.VirtualMachine(executable, tvm.cpu())
+    for count in (2, 4, 8):
+        tensor = torch.randn(count)
+        actual = vm["main"](tvm.runtime.tensor(tensor.numpy()))
+        for actual_value, expected_value in zip(actual, model(tensor)):
             np.testing.assert_array_equal(actual_value.numpy(), expected_value.numpy())
 
 

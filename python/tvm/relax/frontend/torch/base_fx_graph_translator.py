@@ -29,7 +29,7 @@ from functools import reduce
 import tvm_ffi
 
 import tvm
-from tvm import relax, tirx
+from tvm import relax, te, tirx
 from tvm.ir import PrimType
 from tvm.runtime import DataTypeCode
 
@@ -2628,10 +2628,17 @@ class BaseFXGraphImporter(metaclass=abc.ABCMeta):
 
     def _prim_value_to_scalar_tensor(self, value: relax.Expr, dtype: str) -> relax.Var:
         """Materialize an integer primitive value as a rank-zero tensor."""
-        value_tensor = self.block_builder.emit(relax.op.shape_to_tensor(relax.ShapeExpr([value])))
-        if dtype != "int64":
-            value_tensor = self.block_builder.emit(relax.op.astype(value_tensor, dtype))
-        return self.block_builder.emit(relax.op.squeeze(value_tensor, axis=[0]))
+
+        # Keep shape arithmetic in its original integer type, but materialize
+        # only the requested tensor dtype.  A shape_to_tensor + astype sequence
+        # otherwise requires an int64 device buffer even for an int32/float32
+        # result, which targets such as WebGPU cannot represent.
+        def scalar_tensor(scalar):
+            return te.compute((), lambda: tirx.Cast(dtype, scalar), name="scalar_tensor")
+
+        return self.block_builder.emit(
+            self.block_builder.call_te(scalar_tensor, value, primfunc_name_hint="scalar_tensor")
+        )
 
     def _inplace_fill(self, node: fx.Node) -> relax.Var:
         args = self.retrieve_args(node)
