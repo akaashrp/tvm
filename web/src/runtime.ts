@@ -25,6 +25,7 @@ import {
   Disposable,
   SampledTokenReadbackBatch,
   SampledTokenReadbackRingOptions,
+  WebGPUExecutionOptions,
 } from "./types";
 import { Memory, CachedCallStack, WasmByteArraySource } from "./memory";
 import {
@@ -2294,8 +2295,9 @@ export class Instance implements Disposable {
   /**
    * Initialize webgpu in the runtime.
    * @param device The given GPU device.
+   * @param options Command submission limits.
    */
-  initWebGPU(device: GPUDevice): void {
+  initWebGPU(device: GPUDevice, options: WebGPUExecutionOptions = {}): void {
     device.addEventListener("uncapturederror", (event) => {
       console.error("A WebGPU error was not captured: ", event);
     });
@@ -2309,7 +2311,7 @@ export class Instance implements Disposable {
     this.deviceLostIsError = true;
 
     const webGPUContext = new WebGPUContext(
-      this.memory, device
+      this.memory, device, options
     );
     this.registerFunc("wasm.WebGPUDeviceAPI", (name: string) => {
       return webGPUContext.getDeviceAPI(name);

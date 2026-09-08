@@ -94,3 +94,8 @@ export interface SampledTokenReadbackBatch {
    */
   tokens: Int32Array;
 }
+/** Controls command submission without changing model precision or weights. */
+export interface WebGPUExecutionOptions {
+  /** Maximum compute dispatches per submission. Defaults to 128; zero is unbounded. */
+  maxDispatchesPerSubmit?: number;
+}

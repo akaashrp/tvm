@@ -160,14 +160,14 @@ function createMockDevice({
   };
 }
 
-function createContext(deviceOptions) {
+function createContext(deviceOptions, executionOptions) {
   const gpu = createMockDevice(deviceOptions);
   const memory = {
     loadRawBytes: jest.fn(),
     viewRawBytes: jest.fn(),
     storeRawBytes: jest.fn(),
   };
-  const context = new WebGPUContext(memory, gpu.device);
+  const context = new WebGPUContext(memory, gpu.device, executionOptions);
   const allocate = context.getDeviceAPI("deviceAllocDataSpace");
 
   return {
@@ -192,6 +192,44 @@ test.each([[0, 4], [1, 4], [2, 4], [3, 4], [4, 4], [5, 8], [16, 16]])(
     expect(buffer.destroy).toHaveBeenCalledTimes(1);
   }
 );
+
+test.each([-1, 1.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1])(
+  "submission limits reject invalid value %p", (maxDispatchesPerSubmit) => {
+    expect(() => createContext(undefined, { maxDispatchesPerSubmit }))
+      .toThrow("maxDispatchesPerSubmit");
+  }
+);
+
+test.each([
+  [undefined, 128, 2],
+  [{ maxDispatchesPerSubmit: 4 }, 4, 2],
+  [{ maxDispatchesPerSubmit: 0 }, 128, 0],
+])("submission limits preserve command ordering: %p", async (options, limit, submits) => {
+  const { context, queue, encoders, source, destination } = createContext(undefined, options);
+  const shader = context.createShader(
+    { name: "bounded", arg_types: [], launch_param_tags: [] },
+    "@compute @workgroup_size(1) fn main() {}"
+  );
+  const copy = context.getDeviceAPI("deviceCopyWithinGPU");
+  for (let index = 0; index < limit * 2 + 1; index++) {
+    shader();
+    copy(source, 0, destination, 0, 16);
+  }
+  expect(queue.submit).toHaveBeenCalledTimes(submits);
+  // Submission boundaries must neither drop nor reorder copies relative to
+  // dispatches. A final sync also submits the partial trailing batch.
+  await context.sync();
+  expect(queue.submit).toHaveBeenCalledTimes(submits + 1);
+  expect(encoders.flatMap(encoder => encoder.commands)).toEqual(
+    Array.from({length: limit * 2 + 1}, () => ["compute", "copy"]).flat()
+  );
+  if (submits) {
+    for (const encoder of encoders) {
+      expect(encoder.commands.filter(command => command === "compute").length)
+        .toBeLessThanOrEqual(limit);
+    }
+  }
+});
 
 test("device detection requests both workgroup invocation and X-axis limits", async () => {
   const originalNavigator = Object.getOwnPropertyDescriptor(globalThis, "navigator");
@@ -300,7 +338,7 @@ test("timestamp capacity growth submits before replacing the query set", async (
     queue,
     querySets,
     invalidTimestampSubmissions,
-  } = createContext({ timestampQuery: true });
+  } = createContext({ timestampQuery: true }, { maxDispatchesPerSubmit: 0 });
   const shader = context.createShader(
     {
       name: "main",

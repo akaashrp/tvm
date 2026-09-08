@@ -23,6 +23,7 @@ import {
   Disposable,
   SampledTokenReadbackBatch,
   SampledTokenReadbackRingOptions,
+  WebGPUExecutionOptions,
 } from "./types";
 
 // Keep ordered staging focused on small control uploads. Large writes are
@@ -660,6 +661,7 @@ export class WebGPUContext {
   private uploadBufferPool: Array<GPUBuffer> = [];
   private uploadBufferPoolSizes: Array<number> = [];
   private pendingDispatchCount = 0;
+  private readonly maxDispatchesPerSubmit: number;
   private pendingGPUToGPUCopyCount = 0;
   private pendingGPUToGPUCopyBytes = 0;
   private pendingStagedUploadCount = 0;
@@ -693,7 +695,12 @@ export class WebGPUContext {
   // log and sync each step
   protected debugLogFinish = false;
 
-  constructor(memory: Memory, device: GPUDevice) {
+  constructor(memory: Memory, device: GPUDevice, options: WebGPUExecutionOptions = {}) {
+    const limit = options.maxDispatchesPerSubmit ?? 128;
+    if (!Number.isSafeInteger(limit) || limit < 0) {
+      throw new Error("maxDispatchesPerSubmit must be a non-negative safe integer.");
+    }
+    this.maxDispatchesPerSubmit = limit;
     this.memory = memory;
     this.device = device;
     runtimeTraceEmit(
@@ -909,6 +916,7 @@ export class WebGPUContext {
         {
           submit_seq: submitSeq,
           dispatches: submittedDispatches,
+          max_dispatches_per_submit: this.maxDispatchesPerSubmit,
           uniform_arena_count: submittedUniformArenaCount,
           uniform_argument_bytes: submittedUniformArgumentBytes,
           uniform_reserved_bytes: submittedUniformReservedBytes,
@@ -1894,6 +1902,13 @@ export class WebGPUContext {
           });
         }
         this.shaderSubmitCounter += 1;
+        // Bound command-buffer growth for long device-resident loops. Submit
+        // only after ending the compute pass; queue ordering preserves state
+        // dependencies and permits uniform arenas to be reused safely.
+        if (this.maxDispatchesPerSubmit > 0 &&
+            this.pendingDispatchCount >= this.maxDispatchesPerSubmit) {
+          this.flushCommands();
+        }
       };
       return submitShader;
     };

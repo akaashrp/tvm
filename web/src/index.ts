@@ -50,3 +50,4 @@ export type { RNGState } from "./support";
 export { detectGPUDevice, GPUDeviceDetectOutput } from "./webgpu";
 export { LRUCache, CacheState } from "./cache_state";
 export { createPolyfillWASI } from "./compact";
+export type { WebGPUExecutionOptions } from "./types";
