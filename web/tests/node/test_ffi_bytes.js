@@ -116,6 +116,39 @@ test("PackedFunc non-byte arguments do not allocate byte-source descriptors", ()
     .toBeUndefined();
 });
 
+test("Callback conversion preserves borrowed arguments across repeated calls", () => {
+  const { SizeOf } = require("../../src/ctypes");
+  const stack = tvm.lib.getOrAllocCallStack();
+  const text = "borrowed VM instrumentation symbol with a heap-backed string";
+  const bytes = makeBytes(1024);
+  const observed = [];
+  try {
+    const argsOffset = stack.allocRawBytes(2 * SizeOf.TVMFFIAny);
+    const retOffset = stack.allocRawBytes(SizeOf.TVMFFIAny);
+    tvm.setPackedArguments(stack, [text, bytes], argsOffset);
+    stack.commitToWasmMemory();
+    const argsPtr = stack.ptrFromOffset(argsOffset);
+    const retPtr = stack.ptrFromOffset(retOffset);
+    const argumentBytes = () => new Uint8Array(
+      tvm.memory.memory.buffer, argsPtr, 2 * SizeOf.TVMFFIAny
+    ).slice();
+    const originalArguments = argumentBytes();
+    const callback = tvm.wrapJSFuncAsSafeCallType((value, payload) => {
+      observed.push(value);
+      expectExactBytes(payload, bytes);
+      // A nested call must not invalidate the outer callback's owned values.
+      expect(tvm.getGlobalFunc("testing.echo")(value)).toBe(text);
+    });
+    for (let i = 0; i < 2; ++i) {
+      expect(callback(0, argsPtr, 2, retPtr)).toBe(0);
+      expectExactBytes(argumentBytes(), originalArguments);
+    }
+    expect(observed).toEqual([text, text]);
+  } finally {
+    tvm.lib.recycleCallStack(stack);
+  }
+});
+
 test("PackedFunc captures Wasm-backed byte sources automatically", () => {
   const ptr = tvm.exports.TVMWasmAllocSpace(32);
   if (ptr === 0) {

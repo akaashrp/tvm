@@ -16,9 +16,9 @@
 # under the License.
 # Run jest based on current OS
 
-import os
+import subprocess
+import sys
+from pathlib import Path
 
-if os.name == "nt":
-    os.system("node_modules\\.bin\\jest")
-else:
-    os.system("node node_modules/.bin/jest")
+jest = Path(__file__).resolve().parent / "node_modules" / "jest" / "bin" / "jest.js"
+raise SystemExit(subprocess.call(["node", str(jest), *sys.argv[1:]]))

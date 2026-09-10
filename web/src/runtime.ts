@@ -2555,11 +2555,14 @@ export class Instance implements Disposable {
       try {
         // use scope to track js values.
         this.ctx.beginScope();
+        let callbackStack: CachedCallStack | undefined;
+        let ownedArgPtr: Pointer = 0;
         try {
           const jsArgs = [];
           for (let i = 0; i < numArgs; ++i) {
             const argPtr = packedArgs + i * SizeOf.TVMFFIAny;
             const typeIndex = lib.memory.loadI32(argPtr);
+            let convertedArgPtr = argPtr;
 
             if (typeIndex >= TypeIndex.kTVMFFIRawStr) {
               // NOTE: the following code have limitations in asyncify mode.
@@ -2568,19 +2571,32 @@ export class Instance implements Disposable {
               if (!this.asyncifyHandler.isNormalStackState()) {
                 throw Error("Cannot handle str/object argument callback in asyncify mode");
               }
+              if (callbackStack === undefined) {
+                callbackStack = lib.getOrAllocCallStack();
+                ownedArgPtr = callbackStack.ptrFromOffset(
+                  callbackStack.allocRawBytes(SizeOf.TVMFFIAny)
+                );
+              }
+              // PackedArgs borrows the caller's AnyView storage. Converting it
+              // in place can leave a freed owned String in a reused argument
+              // array, as in VM instrumentation before/after callbacks.
+              convertedArgPtr = ownedArgPtr;
               lib.checkCall(
                 (lib.exports.TVMFFIAnyViewToOwnedAny as ctypes.FTVMFFIAnyViewToOwnedAny)(
                   argPtr,
-                  argPtr
+                  convertedArgPtr
                 )
               );
             }
-            jsArgs.push(this.retValueToJS(argPtr, true));
+            jsArgs.push(this.retValueToJS(convertedArgPtr, true));
           }
           rv = func(...jsArgs);
         } finally {
           // recycle all js object values created for the callback.
           this.ctx.endScope();
+          if (callbackStack !== undefined) {
+            lib.recycleCallStack(callbackStack);
+          }
         }
 
         if (rv !== undefined && rv !== null) {
