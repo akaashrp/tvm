@@ -32,6 +32,55 @@ def _check(mod_actual, mod_expected):
     tvm.ir.assert_structural_equal(mod_actual, mod_expected)
 
 
+def test_conditional_shape_preserves_intrinsic_type_during_fusion():
+    import numpy as np
+
+    @I.ir_module
+    class Before:
+        @R.function
+        def main(x: R.Tensor(("n", 16), "float32")):
+            n = T.int64()
+            with R.dataflow():
+                a = R.full((T.if_then_else(n > 1, n, 1), 16), R.const(0.5, "float32"), "float32")
+                b = R.add(a, a)
+                R.output(b)
+            return b
+
+    fused = tvm.transform.Sequential(
+        [
+            relax.transform.LegalizeOps(),
+            relax.transform.AnnotateTIROpPattern(),
+            relax.transform.FuseOps(),
+            relax.transform.FuseTIR(),
+        ]
+    )(Before)
+    vm = relax.VirtualMachine(relax.build(fused, target="llvm"), tvm.cpu())
+    for length in (0, 1, 17):
+        values = tvm.runtime.tensor(np.zeros((length, 16), dtype="float32"))
+        np.testing.assert_array_equal(
+            vm["main"](values).numpy(), np.ones((max(length, 1), 16), dtype="float32")
+        )
+
+
+def test_tensor_call_still_reinfers_dtype_after_argument_replacement():
+    x = relax.Var("x", relax.TensorType((2, 16), "float32"))
+    w = relax.Var("w", relax.TensorType((16, 32), "float32"))
+    original = relax.BlockBuilder().normalize(relax.op.matmul(x, w))
+    replacements = {
+        x: relax.Var("x_half", relax.TensorType((2, 16), "float16")),
+        w: relax.Var("w_half", relax.TensorType((16, 32), "float16")),
+    }
+
+    @relax.expr_functor.mutator
+    class Rewrite(relax.PyExprMutator):
+        def visit_var_(self, var):
+            return replacements.get(var, var)
+
+    changed = Rewrite().visit_expr(original)
+    assert str(changed.ty.dtype) == "float16"
+    assert str(original.ty.dtype) == "float32"
+
+
 def test_fuse_simple():
     """Simple testcase."""
 

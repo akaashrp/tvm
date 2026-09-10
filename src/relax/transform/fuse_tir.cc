@@ -156,6 +156,27 @@ class SymbolicMatcher : ExprFunctor<void(const Expr& n, const PrimExpr& other)> 
     }
   }
 
+  void VisitExpr_(const CallNode* op, const PrimExpr& other) {
+    const auto* rhs = other.as<CallNode>();
+    bool matching =
+        rhs && op->op.same_as(rhs->op) && ffi::StructuralEqual()(op->attrs, rhs->attrs) &&
+        ffi::StructuralEqual()(op->ty_args, rhs->ty_args) && op->args.size() == rhs->args.size();
+    if (matching) {
+      for (size_t i = 0; i < op->args.size(); ++i) {
+        matching &=
+            op->args[i].as<PrimExpr>().has_value() && rhs->args[i].as<PrimExpr>().has_value();
+      }
+    }
+    if (matching) {
+      // Include the predicate as well as both branches of conditional shapes.
+      for (size_t i = 0; i < op->args.size(); ++i) {
+        VisitExpr(op->args[i], rhs->args[i].as_or_throw<PrimExpr>());
+      }
+    } else {
+      must_prove_ = must_prove_ && (ffi::GetRef<Call>(op).as_or_throw<PrimExpr>() == other);
+    }
+  }
+
   arith::AnalyzerObj* analyzer_;
   ffi::Map<tirx::Var, PrimExpr>* var_remap_;
   PrimExpr must_prove_ = IntImm::Bool(true);
@@ -456,6 +477,13 @@ class RelaxToTIRVarMapCollector : public ExprVisitor {
     static const Op& call_tir_op_ = Op::Get("relax.call_tir");
     static const Op& call_tir_inplace_op_ = Op::Get("relax.call_tir_inplace");
 
+    const auto* intrinsic = call->op.as<OpNode>();
+    if (call->ty.as<PrimTypeNode>() && intrinsic && intrinsic->name.starts_with("tirx.")) {
+      // Scalar expressions inside dependent shapes do not map tensor buffers.
+      ExprVisitor::VisitExpr_(call);
+      return;
+    }
+
     TVM_FFI_ICHECK(call->op.same_as(call_tir_op_) || call->op.same_as(call_tir_inplace_op_))
         << "Only call_tir and call_tir_inplace are supported in primitive function, but got: "
         << ffi::GetRef<Expr>(call);
@@ -667,6 +695,12 @@ class FusedTIRConstructor : public ExprVisitor {
     ExprVisitor::VisitExpr_(call);
     static const Op& call_tir_op_ = Op::Get("relax.call_tir");
     static const Op& call_tir_inplace_op_ = Op::Get("relax.call_tir_inplace");
+
+    const auto* intrinsic = call->op.as<OpNode>();
+    if (call->ty.as<PrimTypeNode>() && intrinsic && intrinsic->name.starts_with("tirx.")) {
+      // Shape arithmetic is already embedded in the fused TIR buffer shapes.
+      return;
+    }
 
     TVM_FFI_ICHECK(call->op.same_as(call_tir_op_) || call->op.same_as(call_tir_inplace_op_))
         << "Only call_tir and call_tir_inplace are supported in primitive function, but got: "

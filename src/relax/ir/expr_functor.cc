@@ -523,7 +523,13 @@ Expr ExprMutatorBase::VisitExpr_(const CallNode* call_node) {
     // the old result may contain both rewritten dependent dimensions and
     // stale derived metadata (for example an unknown dtype).  Invalidate the
     // complete result so BlockBuilder can infer it from the rebuilt call.
-    Type rebuilt_ret_ty = unchanged ? ret_ty : Type::Missing();
+    // TIR intrinsics carry an explicit primitive return type.  Symbol
+    // substitution in a dependent shape must retain that type: these calls
+    // have no Relax FInferType rule from which to reconstruct it.
+    const auto* intrinsic = new_op.as<OpNode>();
+    bool explicit_primitive_type =
+        ret_ty.as<PrimTypeNode>() && intrinsic && intrinsic->name.starts_with("tirx.");
+    Type rebuilt_ret_ty = (unchanged || explicit_primitive_type) ? ret_ty : Type::Missing();
     return Call(rebuilt_ret_ty, new_op, call_args, call_node->attrs, ty_args, call_node->span);
   }
 }

@@ -397,7 +397,17 @@ class GraphCreator : public ExprVisitor {
 class FunctionCreator : public ExprMutator {
  public:
   explicit FunctionCreator(bool lift_constant, ffi::Map<Var, Expr> outer_bindings)
-      : outer_bindings_(std::move(outer_bindings)), lift_constant_(lift_constant) {}
+      : outer_bindings_(std::move(outer_bindings)), lift_constant_(lift_constant) {
+    // An allocation's dimensions need not occur in any tensor input. Keep
+    // caller dimension symbols available until CreateFunction captures them
+    // through an explicit Shape parameter, including when a scalar use comes
+    // before the allocation within the group.
+    for (const auto& binding : outer_bindings_) {
+      for (const tirx::Var& var : TIRVarsInType(binding.first->ty)) {
+        caller_shape_vars_.insert(var);
+      }
+    }
+  }
   /*!
    * \brief Append a new binding to this function and possibly create new parameters for the
    * function accordingly
@@ -703,7 +713,7 @@ class FunctionCreator : public ExprMutator {
         return true;
       }
 
-      std::unordered_set<tirx::Var> referenced_shape_vars;
+      std::unordered_set<tirx::Var> referenced_shape_vars = caller_shape_vars_;
       for (const tirx::Var& var : TIRVarsInType(parameter_types)) {
         referenced_shape_vars.insert(var);
       }
@@ -729,6 +739,8 @@ class FunctionCreator : public ExprMutator {
   std::vector<const VarNode*> output_vars_;
   /*! \brief Bindings in the caller function, used to inline static leaf expressions. */
   ffi::Map<Var, Expr> outer_bindings_;
+  /*! \brief Symbols appearing in caller binding types, including allocation results. */
+  std::unordered_set<tirx::Var> caller_shape_vars_;
   /*! \brief Whether or not to lift bound constants to parameters */
   bool lift_constant_;
   /*! \brief Mapping from tuple parameter of the function to its position index */
