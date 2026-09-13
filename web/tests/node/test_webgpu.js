@@ -231,6 +231,53 @@ test.each([
   }
 });
 
+test.each([-1, 1.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1])(
+  "deferred destruction limits reject invalid value %p", (maxDeferredDestroyBytes) => {
+    expect(() => createContext(undefined, { maxDeferredDestroyBytes }))
+      .toThrow("maxDeferredDestroyBytes");
+  }
+);
+
+test.each([0, 128])("deferred destruction byte limit preserves copy ordering: %i", async (limit) => {
+  const { context, queue, buffers, events, source, destination } = createContext(
+    undefined, { maxDispatchesPerSubmit: 0, maxDeferredDestroyBytes: limit }
+  );
+  const copy = context.getDeviceAPI("deviceCopyWithinGPU");
+  const free = context.getDeviceAPI("deviceFreeDataSpace");
+  const allocate = context.getDeviceAPI("deviceAllocDataSpace");
+  copy(source, 0, destination, 0, 16);
+  free(source);
+  expect(queue.submit).not.toHaveBeenCalled();
+  const replacement = allocate(64);
+  copy(destination, 0, replacement, 0, 16);
+  free(destination);
+  expect(queue.submit).toHaveBeenCalledTimes(limit ? 1 : 0);
+  expect(queue.onSubmittedWorkDone).not.toHaveBeenCalled();
+  if (!limit) context.flushCommands();
+  expect(events).toEqual(["copy", "copy", "finish", "submit", "destroy", "destroy"]);
+  expect(buffers[2].destroy).not.toHaveBeenCalled();
+  // The budget resets after submission. A remaining partial batch is flushed
+  // by the ordinary synchronization boundary.
+  const next = allocate(64);
+  copy(replacement, 0, next, 0, 16);
+  free(replacement);
+  expect(queue.submit).toHaveBeenCalledTimes(1);
+  await context.sync();
+  expect(queue.submit).toHaveBeenCalledTimes(2);
+  expect(buffers[2].destroy).toHaveBeenCalledTimes(1);
+});
+
+test("a single oversized deferred buffer is submitted before destruction", () => {
+  const { context, queue, events, destination } = createContext(
+    undefined, { maxDeferredDestroyBytes: 128 }
+  );
+  const large = context.getDeviceAPI("deviceAllocDataSpace")(256);
+  context.getDeviceAPI("deviceCopyWithinGPU")(large, 0, destination, 0, 16);
+  context.getDeviceAPI("deviceFreeDataSpace")(large);
+  expect(queue.submit).toHaveBeenCalledTimes(1);
+  expect(events).toEqual(["copy", "finish", "submit", "destroy"]);
+});
+
 test("device detection requests both workgroup invocation and X-axis limits", async () => {
   const originalNavigator = Object.getOwnPropertyDescriptor(globalThis, "navigator");
   const requestDevice = jest.fn(async () => ({ id: "device" }));

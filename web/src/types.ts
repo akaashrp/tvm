@@ -96,6 +96,10 @@ export interface SampledTokenReadbackBatch {
 }
 /** Controls command submission without changing model precision or weights. */
 export interface WebGPUExecutionOptions {
-  /** Maximum compute dispatches per submission. Defaults to 128; zero is unbounded. */
+  /** Maximum compute dispatches per submission. Defaults to 128; zero disables this limit. */
   maxDispatchesPerSubmit?: number;
+  /** Submit when buffers awaiting destruction reach this many bytes.
+   * Defaults to 512 MiB; zero is unbounded. This is not a total GPU memory cap.
+   */
+  maxDeferredDestroyBytes?: number;
 }

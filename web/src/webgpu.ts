@@ -662,6 +662,7 @@ export class WebGPUContext {
   private uploadBufferPoolSizes: Array<number> = [];
   private pendingDispatchCount = 0;
   private readonly maxDispatchesPerSubmit: number;
+  private readonly maxDeferredDestroyBytes: number;
   private pendingGPUToGPUCopyCount = 0;
   private pendingGPUToGPUCopyBytes = 0;
   private pendingStagedUploadCount = 0;
@@ -701,6 +702,11 @@ export class WebGPUContext {
       throw new Error("maxDispatchesPerSubmit must be a non-negative safe integer.");
     }
     this.maxDispatchesPerSubmit = limit;
+    const destroyLimit = options.maxDeferredDestroyBytes ?? 512 * 1024 * 1024;
+    if (!Number.isSafeInteger(destroyLimit) || destroyLimit < 0) {
+      throw new Error("maxDeferredDestroyBytes must be a non-negative safe integer.");
+    }
+    this.maxDeferredDestroyBytes = destroyLimit;
     this.memory = memory;
     this.device = device;
     runtimeTraceEmit(
@@ -917,6 +923,7 @@ export class WebGPUContext {
           submit_seq: submitSeq,
           dispatches: submittedDispatches,
           max_dispatches_per_submit: this.maxDispatchesPerSubmit,
+          max_deferred_destroy_bytes: this.maxDeferredDestroyBytes,
           uniform_arena_count: submittedUniformArenaCount,
           uniform_argument_bytes: submittedUniformArgumentBytes,
           uniform_reserved_bytes: submittedUniformReservedBytes,
@@ -2144,6 +2151,13 @@ export class WebGPUContext {
     if (deferDestroy) {
       this.pendingBufferDestroys.push(buffer);
       this.pendingBufferDestroyBytes += buffer.size;
+      // A small dispatch count can still retain gigabytes of dead scratch
+      // buffers. Submit their uses before destroying them, without waiting for
+      // the GPU. Queue ordering and the normal flush path preserve dependencies.
+      if (this.maxDeferredDestroyBytes > 0 &&
+          this.pendingBufferDestroyBytes >= this.maxDeferredDestroyBytes) {
+        this.flushCommands();
+      }
     } else {
       buffer.destroy();
     }
