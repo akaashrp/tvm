@@ -16,6 +16,8 @@
 # under the License.
 # pylint: disable=invalid-name, missing-docstring
 
+import pytest
+
 import tvm
 import tvm.testing
 from tvm.script import ir as I
@@ -95,6 +97,53 @@ def test_rewrite_to_shuffle_1():
 
     After = transform(Before)
     tvm.ir.assert_structural_equal(After, Expected)
+
+
+@pytest.mark.parametrize("stride", [4, 8, 12])
+@pytest.mark.parametrize("offset", [0, 1, 3])
+def test_scalar_shuffle_stride_multiple_of_vector_width(stride, offset):
+    @I.ir_module
+    class Before:
+        @T.prim_func(s_tir=True)
+        def main(A: T.Buffer((64,), "float32"), B: T.Buffer((4,), "float32")):
+            local = T.alloc_buffer((64,), scope="local")
+            for i in range(16):
+                local[i * 4 : i * 4 + 4] = A[i * 4 : i * 4 + 4]
+            for i in range(4):
+                B[i] = local[i * stride + offset]
+
+    @I.ir_module
+    class Expected:
+        @T.prim_func(s_tir=True)
+        def main(A: T.Buffer((16,), "float32x4"), B: T.Buffer((4,), "float32")):
+            local = T.alloc_buffer((16,), "float32x4", scope="local")
+            for i in range(16):
+                local[T.Div(i * 4, 4)] = A[T.Div(i * 4, 4)]
+            for i in range(4):
+                B[i] = T.Shuffle([local[T.Div(i * stride + offset, 4)]], [offset])
+
+    tvm.ir.assert_structural_equal(tvm.tirx.transform.PointerValueTypeRewrite()(Before), Expected)
+
+
+def test_scalar_stride_incompatible_with_vector_width():
+    @I.ir_module
+    class Before:
+        @T.prim_func(s_tir=True)
+        def main(A: T.Buffer((16,), "float32"), B: T.Buffer((4,), "float32")):
+            local = T.alloc_buffer((16,), scope="local")
+            for i in range(4):
+                local[i * 4 : i * 4 + 4] = A[i * 4 : i * 4 + 4]
+            for i in range(4):
+                B[i] = local[i * 2 + 1]
+
+    after = tvm.tirx.transform.PointerValueTypeRewrite()(Before)
+    allocations = []
+    tvm.tirx.stmt_functor.post_order_visit(
+        after["main"].body,
+        lambda node: (allocations.append(node) if isinstance(node, tvm.tirx.AllocBuffer) else None),
+    )
+    assert len(allocations) == 1
+    assert allocations[0].buffer.ty.dtype == tvm.ir.PrimType("float32")
 
 
 def test_address_of():

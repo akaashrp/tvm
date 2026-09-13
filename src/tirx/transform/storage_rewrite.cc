@@ -1661,7 +1661,9 @@ class VectorTypeRewriter : public StmtExprMutator {
       indices.Set(indices.size() - 1, new_index);
     } else if (last_dim_index.ty().lanes() == 1 && info.factor() > 1) {
       arith::ModularSet me = analyzer_->modular_set(last_dim_index);
-      TVM_FFI_ICHECK(me->coeff == 0 || info.factor() % me->coeff == 0);
+      // A scalar read can select a fixed lane when its stride is a multiple
+      // of the vector width, including strides larger than that width.
+      TVM_FFI_ICHECK(me->coeff % info.factor() == 0);
       PrimExpr new_index = last_dim_index / MakeConst(last_dim_index.ty(), info.factor());
       shuffle_index = me->base % info.factor();
       indices.Set(indices.size() - 1, new_index);
