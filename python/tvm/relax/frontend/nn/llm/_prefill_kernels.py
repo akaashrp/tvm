@@ -392,7 +392,9 @@ def _attention_prefill(
 
 
 
-def _attention_sequence_prefill(h_kv, h_q, d, dtype, target: Target, causal=0, sm_scale=1.0):
+def _attention_sequence_prefill(
+    h_kv, h_q, d, dtype, target: Target, causal=0, sm_scale=1.0, key_storage_align=False
+):
     _, LOAD_VEC, group_size, bdx, num_warps, tile_x, tile_y, tile_z = _get_prefill_kernel_config(h_kv, h_q, d, dtype, target)
     # Reuse each K/V tile across more queries in dense FP32 attention.  Keep
     # the conservative configuration for smaller workgroup-storage budgets
@@ -469,7 +471,7 @@ def _attention_sequence_prefill(h_kv, h_q, d, dtype, target: Target, causal=0, s
                                     with T.sblock("K_load"):
                                         i, j = T.axis.remap("SS", [lz, ly])
                                         T.reads()
-                                        T.writes()
+                                        T.writes(K_smem[i, j])
                                         cur_L: T.let[T.int32] = L_kv_start + i
                                         if cur_L < kv_len:
                                             K_smem[i, j] = k[
@@ -514,6 +516,10 @@ def _attention_sequence_prefill(h_kv, h_q, d, dtype, target: Target, causal=0, s
 
     # pylint: enable=too-many-branches
     sch = tvm.s_tir.Schedule(batch_sequence_prefill_kv)
+    if key_storage_align:
+        # Separate adjacent key rows across shared-memory banks. Keep this
+        # device-qualified layout opt-in; the tile and arithmetic are unchanged.
+        sch.storage_align(sch.get_sblock("K_load"), 0, axis=0, factor=32, offset=1)
     sch = _schedule_prefill_kernel(sch, LOAD_VEC, bdx, num_warps, tile_x, tile_y, tile_z, False, False)
     return sch.mod["main"].with_attr("tirx.is_scheduled", True)
 

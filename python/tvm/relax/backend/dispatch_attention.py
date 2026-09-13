@@ -165,9 +165,10 @@ def get_attention_dispatch_info(
 class AttentionDispatcher(BackendDispatcher):
     """Replace eligible attention calls whose score buffer exceeds a byte limit."""
 
-    def __init__(self, mod: IRModule, max_score_buffer_bytes: int):
+    def __init__(self, mod: IRModule, max_score_buffer_bytes: int, key_storage_align: bool = False):
         super().__init__(mod)
         self.max_score_buffer_bytes = max_score_buffer_bytes
+        self.key_storage_align = key_storage_align
         self.kernels = {}
         self.upper_bounds = {}
         self.lower_bounds = {}
@@ -212,6 +213,7 @@ class AttentionDispatcher(BackendDispatcher):
                 target,
                 causal=0,
                 sm_scale=info.scale,
+                key_storage_align=self.key_storage_align,
             )
             global_var = self.builder_.add_func(kernel, "online_attention")
             self.kernels[kernel_key] = global_var
@@ -229,15 +231,23 @@ class AttentionDispatcher(BackendDispatcher):
         return relax.TupleGetItem(result, 0)
 
 
-def DispatchAttention(max_score_buffer_bytes: int = 128 * 1024 * 1024):
-    """Create a pass that bounds the materialized attention score buffer."""
+def DispatchAttention(
+    max_score_buffer_bytes: int = 128 * 1024 * 1024, *, key_storage_align: bool = False
+):
+    """Bound the materialized score buffer with online WebGPU attention.
+
+    ``key_storage_align`` pads shared key rows to reduce bank conflicts on
+    qualified devices. It preserves arithmetic and is disabled by default.
+    """
 
     if max_score_buffer_bytes < 0:
         raise ValueError("max_score_buffer_bytes must be nonnegative")
+    if type(key_storage_align) is not bool:
+        raise ValueError("key_storage_align must be a boolean")
 
     @module_pass(opt_level=0, name="DispatchAttention")
     def _dispatch_attention(mod: IRModule, _ctx: PassContext) -> IRModule:
-        dispatcher = AttentionDispatcher(mod, max_score_buffer_bytes)
+        dispatcher = AttentionDispatcher(mod, max_score_buffer_bytes, key_storage_align)
         for global_var, function in mod.functions_items():
             if isinstance(function, relax.Function):
                 attrs = function.attrs or {}

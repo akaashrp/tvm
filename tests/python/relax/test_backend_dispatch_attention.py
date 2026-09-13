@@ -210,12 +210,21 @@ def test_rejects_negative_score_buffer_limit():
 
 
 @pytest.mark.parametrize("shared_memory_bytes", [16384, 32768])
-def test_webgpu_head_dim_128_kernel_fits_shared_memory(shared_memory_bytes):
+@pytest.mark.parametrize("key_storage_align", [False, True])
+def test_webgpu_head_dim_128_kernel_fits_shared_memory(shared_memory_bytes, key_storage_align):
     with _webgpu_target(shared_memory_bytes) as target:
-        after = relax.backend.DispatchAttention(0)(AttentionModule)
+        after = relax.backend.DispatchAttention(0, key_storage_align=key_storage_align)(
+            AttentionModule
+        )
         executable = relax.build(after, target=target)
 
     assert executable is not None
+
+
+@pytest.mark.parametrize("value", [None, 1, "true"])
+def test_key_storage_alignment_requires_boolean(value):
+    with pytest.raises(ValueError, match="key_storage_align must be a boolean"):
+        relax.backend.DispatchAttention(0, key_storage_align=value)
 
 
 if __name__ == "__main__":
