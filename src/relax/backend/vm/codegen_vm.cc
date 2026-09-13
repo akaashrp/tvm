@@ -182,11 +182,23 @@ class CodeGenVM : public ExprFunctor<Instruction::Arg(const Expr&)> {
 
     builder_->EmitIf(Instruction::Arg::Register(cond_reg), 3);
     size_t num_instr = exec->instr_offset.size();
+    size_t true_register_begin = registers_num_;
     Instruction::Arg true_value = this->VisitExpr(ife->true_branch);
     // Reserve a register for return
     size_t merge_register = NewRegister();
     // Copy the output from true branch to merge register
     builder_->EmitCall("vm.builtin.copy", {true_value}, merge_register);
+    // The merge register now owns the result.  Branch-local registers cannot
+    // be used outside the branch, but KillAfterLastUse must leave its outputs
+    // alive (including fields of an inline output tuple).  Release the local
+    // registers at this boundary so those references do not outlive the merge.
+    // Captured registers precede this range and remain available to later uses.
+    auto release_branch_registers = [&](size_t begin, size_t end) {
+      for (size_t reg = begin; reg < end; ++reg) {
+        builder_->EmitCall("vm.builtin.null_value", {}, reg);
+      }
+    };
+    release_branch_registers(true_register_begin, merge_register);
 
     // Record the offset of Goto instruction
     size_t goto_offset = exec->instr_offset.size();
@@ -196,9 +208,11 @@ class CodeGenVM : public ExprFunctor<Instruction::Arg(const Expr&)> {
     // Calculate the false offset of If
     size_t false_offset = exec->instr_offset.size() - num_instr + 1;
 
+    size_t false_register_begin = registers_num_;
     Instruction::Arg false_value = this->VisitExpr(ife->false_branch);
     // Copy the output data of false branch to merge register
     builder_->EmitCall("vm.builtin.copy", {false_value}, merge_register);
+    release_branch_registers(false_register_begin, registers_num_);
 
     // Update the offsets of the If instruction emitted above
     // Jump to the behind of the next goto instruction

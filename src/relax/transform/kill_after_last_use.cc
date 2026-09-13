@@ -153,6 +153,18 @@ class CollectLastUsage : public ExprVisitor {
     last_usage_of_[op] = current_binding_;
   }
 
+  void VisitExpr_(const IfNode* op) override {
+    // Each branch has its own SeqExpr lifetime analysis.  Captured values
+    // remain live through the conditional, independently of which path runs.
+    VisitExpr(op->cond);
+    for (const auto& var : FreeVars(op->true_branch)) {
+      last_usage_of_[var.get()] = current_binding_;
+    }
+    for (const auto& var : FreeVars(op->false_branch)) {
+      last_usage_of_[var.get()] = current_binding_;
+    }
+  }
+
   void VisitBinding_(const VarBindingNode* binding, const CallNode* val) override {
     static const Op& vm_alloc_storage = Op::Get("relax.vm.alloc_storage");
     static const Op& mem_alloc_storage = Op::Get("relax.memory.alloc_storage");
@@ -214,16 +226,18 @@ class CollectLastUsage : public ExprVisitor {
 class KillInserter : public ExprMutator {
  private:
   Expr VisitExpr_(const FunctionNode* op) override {
+    auto enclosing_usage = std::move(last_usage_);
     last_usage_ = CollectLastUsage::Collect(ffi::GetRef<Expr>(op));
     auto mutated = ExprMutator::VisitExpr_(op);
-    last_usage_.clear();
+    last_usage_ = std::move(enclosing_usage);
     return mutated;
   }
 
   Expr VisitExpr_(const SeqExprNode* op) override {
+    auto enclosing_usage = std::move(last_usage_);
     last_usage_ = CollectLastUsage::Collect(ffi::GetRef<Expr>(op));
     auto mutated = ExprMutator::VisitExpr_(op);
-    last_usage_.clear();
+    last_usage_ = std::move(enclosing_usage);
     return mutated;
   }
 
