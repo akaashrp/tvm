@@ -394,6 +394,17 @@ def _attention_prefill(
 
 def _attention_sequence_prefill(h_kv, h_q, d, dtype, target: Target, causal=0, sm_scale=1.0):
     _, LOAD_VEC, group_size, bdx, num_warps, tile_x, tile_y, tile_z = _get_prefill_kernel_config(h_kv, h_q, d, dtype, target)
+    # Reuse each K/V tile across more queries in dense FP32 attention.  Keep
+    # the conservative configuration for smaller workgroup-storage budgets
+    # and grouped-query attention; cached prefill kernels are unaffected.
+    if (
+        target.kind.name == "webgpu"
+        and dtype == "float32"
+        and d == 128
+        and group_size == 1
+        and int(target.attrs["max_shared_memory_per_block"]) >= 32768
+    ):
+        tile_x, tile_z = 32, 8
     init_states, compute_s_gemm, softmax_update_causal, compute_o_gemm, *_ = _make_prefill_macros(tile_x, tile_y, tile_z, tile_y, bdx, num_warps, group_size)
 
     @T.prim_func(s_tir=True)
