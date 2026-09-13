@@ -27,6 +27,7 @@
 #ifndef TVM_TARGET_WEBGPU_CODEGEN_WEBGPU_H_
 #define TVM_TARGET_WEBGPU_CODEGEN_WEBGPU_H_
 
+#include <tvm/arith/analyzer.h>
 #include <tvm/target/codegen.h>
 
 #include <cstddef>
@@ -108,6 +109,8 @@ class CodeGenWebGPU final : public CodeGenC {
 
   /*! \brief Total bytes declared in the WGSL workgroup address space. */
   size_t workgroup_memory_bytes_{0};
+  /*! \brief Preserve bounds through scalar bindings introduced by CSE. */
+  arith::Analyzer allocation_analyzer_;
   /*! \brief Scalar f32 workgroup broadcasts use atomic bit-preserving storage. */
   std::unordered_set<std::string> atomic_workgroup_buffers_;
 

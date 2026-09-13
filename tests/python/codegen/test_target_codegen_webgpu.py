@@ -133,6 +133,49 @@ def test_bounded_symbolic_stack_allocation():
     assert re.search(r"\bvar\s+\w+\s*:\s*array<f32,\s*128>;", source)
 
 
+def test_bounded_allocation_through_scalar_bindings():
+    @I.ir_module
+    class Module:
+        @T.prim_func(s_tir=True)
+        def main(n: T.int32):
+            T.func_attr(
+                {
+                    "calling_conv": 2,
+                    "global_symbol": "main",
+                    "target": T.target("webgpu"),
+                    "tirx.is_global_func": True,
+                }
+            )
+            extent: T.let[T.int32] = T.min(n, 16)
+            scaled: T.let[T.int32] = extent * 4
+            scratch = T.alloc_buffer((scaled,), "float32", scope="local")
+            T.evaluate(scratch.data)
+
+    source = _build_webgpu(Module).inspect_source()
+    assert re.search(r"\bvar\s+\w+\s*:\s*array<f32,\s*64>;", source)
+
+
+def test_unbounded_allocation_through_scalar_binding_rejected():
+    @I.ir_module
+    class Module:
+        @T.prim_func(s_tir=True)
+        def main(n: T.int32):
+            T.func_attr(
+                {
+                    "calling_conv": 2,
+                    "global_symbol": "main",
+                    "target": T.target("webgpu"),
+                    "tirx.is_global_func": True,
+                }
+            )
+            extent: T.let[T.int32] = n
+            scratch = T.alloc_buffer((extent,), "float32", scope="local")
+            T.evaluate(scratch.data)
+
+    with pytest.raises(tvm.error.InternalError, match="finite compile-time upper bound"):
+        _build_webgpu(Module)
+
+
 def test_unbounded_symbolic_stack_allocation_rejected():
     @I.ir_module
     class Module:
