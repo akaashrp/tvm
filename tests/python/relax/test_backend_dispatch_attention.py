@@ -211,11 +211,14 @@ def test_rejects_negative_score_buffer_limit():
 
 @pytest.mark.parametrize("shared_memory_bytes", [16384, 32768])
 @pytest.mark.parametrize("key_storage_align", [False, True])
-def test_webgpu_head_dim_128_kernel_fits_shared_memory(shared_memory_bytes, key_storage_align):
+@pytest.mark.parametrize("vector_size", [None, 1, 2, 4])
+def test_webgpu_head_dim_128_kernel_fits_shared_memory(
+    shared_memory_bytes, key_storage_align, vector_size
+):
     with _webgpu_target(shared_memory_bytes) as target:
-        after = relax.backend.DispatchAttention(0, key_storage_align=key_storage_align)(
-            AttentionModule
-        )
+        after = relax.backend.DispatchAttention(
+            0, key_storage_align=key_storage_align, vector_size=vector_size
+        )(AttentionModule)
         executable = relax.build(after, target=target)
 
     assert executable is not None
@@ -225,6 +228,12 @@ def test_webgpu_head_dim_128_kernel_fits_shared_memory(shared_memory_bytes, key_
 def test_key_storage_alignment_requires_boolean(value):
     with pytest.raises(ValueError, match="key_storage_align must be a boolean"):
         relax.backend.DispatchAttention(0, key_storage_align=value)
+
+
+@pytest.mark.parametrize("value", [True, 0, 3, 8, 2.0, "4"])
+def test_vector_size_requires_supported_integer(value):
+    with pytest.raises(ValueError, match="vector_size must be"):
+        relax.backend.DispatchAttention(0, vector_size=value)
 
 
 if __name__ == "__main__":
