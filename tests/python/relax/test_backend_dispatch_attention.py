@@ -219,6 +219,16 @@ def test_webgpu_head_dim_128_kernel_fits_shared_memory(
         after = relax.backend.DispatchAttention(
             0, key_storage_align=key_storage_align, vector_size=vector_size
         )(AttentionModule)
+        widths = []
+        for function in after.functions.values():
+            if isinstance(function, tvm.tirx.PrimFunc):
+                tvm.tirx.stmt_functor.post_order_visit(
+                    function.body,
+                    lambda node: widths.append(int(node.extent))
+                    if isinstance(node, tvm.tirx.For) and node.kind == tvm.tirx.ForKind.VECTORIZED
+                    else None,
+                )
+        assert max(widths) == (2 if vector_size is None else vector_size)
         executable = relax.build(after, target=target)
 
     assert executable is not None
