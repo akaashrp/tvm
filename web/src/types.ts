@@ -96,6 +96,10 @@ export interface SampledTokenReadbackBatch {
 }
 /** Controls command submission without changing model precision or weights. */
 export interface WebGPUExecutionOptions {
+  /** Reuse a compute pass for adjacent dispatches. Defaults to true.
+   * Copies and per-dispatch GPU timestamps always close the current pass.
+   */
+  batchComputePasses?: boolean;
   /** Maximum compute dispatches per submission. Defaults to 128; zero disables this limit. */
   maxDispatchesPerSubmit?: number;
   /** Submit when buffers awaiting destruction reach this many bytes.

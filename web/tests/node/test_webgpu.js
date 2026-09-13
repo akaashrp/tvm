@@ -79,31 +79,42 @@ function createMockDevice({
       const commands = [];
       const timestampQuerySets = [];
       const encoderId = encoders.length;
+      let passOpen = false;
+      const requireClosedPass = () => {
+        if (passOpen) throw new Error("Command encoder is locked by an open compute pass");
+      };
       const encoder = {
         commands,
-        beginComputePass: jest.fn((descriptor) => ({
-          setPipeline: jest.fn(),
-          setBindGroup: jest.fn(),
-          dispatchWorkgroups: jest.fn(() => {
-            commands.push("compute");
-            events.push("compute");
-            const timestampWrites = descriptor && descriptor.timestampWrites;
-            const querySet = timestampWrites && timestampWrites.querySet;
-            if (querySet !== undefined) {
-              timestampQuerySets.push(querySet);
-            }
-          }),
-          end: jest.fn(),
-        })),
+        beginComputePass: jest.fn((descriptor) => {
+          requireClosedPass();
+          passOpen = true;
+          return {
+            setPipeline: jest.fn(),
+            setBindGroup: jest.fn(),
+            dispatchWorkgroups: jest.fn(() => {
+              commands.push("compute");
+              events.push("compute");
+              const timestampWrites = descriptor && descriptor.timestampWrites;
+              const querySet = timestampWrites && timestampWrites.querySet;
+              if (querySet !== undefined) {
+                timestampQuerySets.push(querySet);
+              }
+            }),
+            end: jest.fn(() => { passOpen = false; }),
+          };
+        }),
         resolveQuerySet: jest.fn(() => {
+          requireClosedPass();
           commands.push("resolve");
           events.push("resolve");
         }),
         copyBufferToBuffer: jest.fn(() => {
+          requireClosedPass();
           commands.push("copy");
           events.push("copy");
         }),
         finish: jest.fn(() => {
+          requireClosedPass();
           const commandBuffer = { encoderId, commands: commands.slice() };
           if (timestampQuerySets.length > 0) {
             commandBuffer.timestampQuerySets = timestampQuerySets.slice();
@@ -351,6 +362,72 @@ test("compute dispatches and GPU copies share one submission", async () => {
 
   await context.sync();
   expect(queue.submit).toHaveBeenCalledTimes(1);
+});
+
+test("adjacent dispatches share a pass and copies close it before recording", async () => {
+  const { context, encoders, source, destination } = createContext();
+  const shader = context.createShader(
+    { name: "main", arg_types: [], launch_param_tags: [] },
+    "@compute @workgroup_size(1) fn main() {}"
+  );
+  shader();
+  shader();
+  expect(encoders[0].beginComputePass).toHaveBeenCalledTimes(1);
+  const first = encoders[0].beginComputePass.mock.results[0].value;
+  expect(first.dispatchWorkgroups).toHaveBeenCalledTimes(2);
+  expect(first.end).not.toHaveBeenCalled();
+  context.getDeviceAPI("deviceCopyWithinGPU")(source, 0, destination, 0, 16);
+  expect(first.end).toHaveBeenCalledTimes(1);
+  shader();
+  context.copyRawBytesToBuffer(new Uint8Array(16), destination, 0, 16);
+  shader();
+  await context.sync();
+  expect(encoders[0].commands).toEqual(["compute", "compute", "copy", "compute", "copy", "compute"]);
+  expect(encoders[0].beginComputePass).toHaveBeenCalledTimes(3);
+  for (const result of encoders[0].beginComputePass.mock.results) {
+    expect(result.value.end).toHaveBeenCalledTimes(1);
+  }
+});
+
+test("compute pass batching can be disabled without changing submission boundaries", async () => {
+  const { context, encoders, queue } = createContext(undefined, { batchComputePasses: false });
+  const shader = context.createShader(
+    { name: "main", arg_types: [], launch_param_tags: [] },
+    "@compute @workgroup_size(1) fn main() {}"
+  );
+  shader();
+  shader();
+  expect(encoders[0].beginComputePass).toHaveBeenCalledTimes(2);
+  for (const result of encoders[0].beginComputePass.mock.results) {
+    expect(result.value.end).toHaveBeenCalledTimes(1);
+  }
+  expect(queue.submit).not.toHaveBeenCalled();
+  await context.sync();
+  expect(queue.submit).toHaveBeenCalledTimes(1);
+  expect(() => createContext(undefined, { batchComputePasses: 1 })).toThrow("must be a boolean");
+});
+
+test("timestamp tracing separates dispatches after an ordinary batched pass", async () => {
+  const { context, encoders } = createContext({ timestampQuery: true });
+  const shader = context.createShader(
+    { name: "main", arg_types: [], launch_param_tags: [] },
+    "@compute @workgroup_size(1) fn main() {}"
+  );
+  shader();
+  shader();
+  global.__WEBLLM_TRACE_RUNTIME_STATE__ = {
+    enabled: true, level: "major", devtools: "off", ctx: "main", enable_gpu_timestamps: true,
+  };
+  try {
+    shader();
+    shader();
+    await context.sync();
+    const passes = encoders.flatMap(e => e.beginComputePass.mock.results.map(r => r.value));
+    expect(passes.map(p => p.dispatchWorkgroups.mock.calls.length)).toEqual([2, 1, 1]);
+    for (const pass of passes) expect(pass.end).toHaveBeenCalledTimes(1);
+  } finally {
+    delete global.__WEBLLM_TRACE_RUNTIME_STATE__;
+  }
 });
 
 test("pending WebGPU commands can be submitted without waiting", () => {

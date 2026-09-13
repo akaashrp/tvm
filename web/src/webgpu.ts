@@ -647,6 +647,9 @@ export class WebGPUContext {
   // Batched command encoding: accumulate compute passes and GPU copies in a
   // single encoder, and submit only on flush to reduce JS-native transition overhead.
   private pendingEncoder: GPUCommandEncoder | null = null;
+  private pendingComputePass: GPUComputePassEncoder | null = null;
+  private pendingComputePassCount = 0;
+  private readonly batchComputePasses: boolean;
   // Uniform arenas reused across flushes. Dispatch arguments occupy distinct,
   // aligned regions while their command encoder is pending.
   private uniformArenaPool: Array<GPUBuffer> = [];
@@ -697,6 +700,10 @@ export class WebGPUContext {
   protected debugLogFinish = false;
 
   constructor(memory: Memory, device: GPUDevice, options: WebGPUExecutionOptions = {}) {
+    if (options.batchComputePasses !== undefined && typeof options.batchComputePasses !== "boolean") {
+      throw new Error("batchComputePasses must be a boolean.");
+    }
+    this.batchComputePasses = options.batchComputePasses ?? true;
     const limit = options.maxDispatchesPerSubmit ?? 128;
     if (!Number.isSafeInteger(limit) || limit < 0) {
       throw new Error("maxDispatchesPerSubmit must be a non-negative safe integer.");
@@ -868,6 +875,7 @@ export class WebGPUContext {
    */
   flushCommands(): number | undefined {
     if (this.pendingEncoder) {
+      this.endComputePass();
       let queryCount = 0;
       let timestampEntries: RuntimeTimestampEntry[] = [];
       let timestampReadBuffer: GPUBuffer | undefined;
@@ -922,6 +930,7 @@ export class WebGPUContext {
         {
           submit_seq: submitSeq,
           dispatches: submittedDispatches,
+          compute_passes: this.pendingComputePassCount,
           max_dispatches_per_submit: this.maxDispatchesPerSubmit,
           max_deferred_destroy_bytes: this.maxDeferredDestroyBytes,
           uniform_arena_count: submittedUniformArenaCount,
@@ -955,6 +964,7 @@ export class WebGPUContext {
       }
       this.pendingEncoder = null;
       this.pendingDispatchCount = 0;
+      this.pendingComputePassCount = 0;
       this.pendingUniformArenaIndex = 0;
       this.pendingUniformArenaOffset = 0;
       this.pendingUniformArgumentBytes = 0;
@@ -1239,6 +1249,7 @@ export class WebGPUContext {
     const nbytes = tokenCount * 4;
 
     const submitStep = runtimeTraceCurrentStep();
+    this.endComputePass();
     if (!this.pendingEncoder) {
       this.pendingEncoder = this.device.createCommandEncoder();
     }
@@ -1573,6 +1584,7 @@ export class WebGPUContext {
       nbytes % 4 === 0 &&
       toOffset % 4 === 0;
     if (canStage) {
+      this.endComputePass();
       const uploadBuffer = this.getUploadBufferFromPool(nbytes);
       this.device.queue.writeBuffer(
         uploadBuffer,
@@ -1803,7 +1815,15 @@ export class WebGPUContext {
                 },
               }
             : undefined;
-        const compute = this.pendingEncoder.beginComputePass(computePassDescriptor);
+        // A compute usage scope is one dispatch. Adjacent dispatches may share
+        // a pass even when a later dispatch reads an earlier dispatch's output.
+        // Timestamp writes belong to a pass, so traced dispatches stay separate.
+        if (computePassDescriptor !== undefined) this.endComputePass();
+        if (this.pendingComputePass === null) {
+          this.pendingComputePass = this.pendingEncoder.beginComputePass(computePassDescriptor);
+          this.pendingComputePassCount += 1;
+        }
+        const compute = this.pendingComputePass;
         compute.setPipeline(pipeline);
 
         for (let i = 0; i < bufferArgIndices.length; ++i) {
@@ -1881,7 +1901,9 @@ export class WebGPUContext {
         if (timestampEntry !== undefined) {
           this.pendingTimestampEntries.push(timestampEntry);
         }
-        compute.end();
+        if (!this.batchComputePasses || computePassDescriptor !== undefined) {
+          this.endComputePass();
+        }
         runtimeTraceEmit(
           "webgpu.command_encode.end",
           {
@@ -2331,6 +2353,7 @@ export class WebGPUContext {
     // Keep copies in the same command encoder as compute dispatches. Command
     // ordering within the encoder preserves dependencies, while a later
     // readback, CPU write, deallocation, or sync provides the flush point.
+    this.endComputePass();
     if (!this.pendingEncoder) {
       this.pendingEncoder = this.device.createCommandEncoder();
     }
@@ -2349,6 +2372,13 @@ export class WebGPUContext {
     const buffer = this.bufferTable[ptr];
     assert(buffer !== undefined);
     return buffer;
+  }
+
+  private endComputePass(): void {
+    if (this.pendingComputePass !== null) {
+      this.pendingComputePass.end();
+      this.pendingComputePass = null;
+    }
   }
 
   private attachToBufferTable(buffer: GPUBuffer): GPUPointer {
