@@ -1,5 +1,5 @@
 {
-  "name": "tvmjs",
+  "name": "@mlc-ai/web-runtime",
   "description": "TVM WASM/WebGPU runtime for JS/TS",
   "license": "Apache-2.0",
   "homepage": "https://github.com/apache/tvm/tree/main/web",
